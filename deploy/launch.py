@@ -74,10 +74,11 @@ def create_pod():
 
     REPO_URL = "https://github.com/Imtoocompedidiv/qwen-tts-turbo.git"
     # Self-contained startup: clone repo then run start.sh
-    STARTUP_CMD = (
+    STARTUP_CMD = [
+        "bash", "-c",
         f"git clone --depth 1 {REPO_URL} /workspace/qwen-tts-turbo && "
-        f"bash /workspace/qwen-tts-turbo/deploy/start.sh"
-    )
+        f"bash /workspace/qwen-tts-turbo/deploy/start.sh",
+    ]
 
     def try_create(dc, vol_id):
         for gpu in GPU_CHAIN:
@@ -101,6 +102,10 @@ def create_pod():
                 cost = result.get("costPerHr", "?")
                 print(f"Pod {result['id']} created: {gpu_name} in {dc} @ ${cost}/hr")
                 return result["id"]
+            elif result:
+                # Log API errors (schema mismatch, out of stock, etc.)
+                err = result[0].get("error", result) if isinstance(result, list) else result
+                print(f"    {gpu}: {err}")
         return None
 
     # Try each DC (with or without volume)
