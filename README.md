@@ -2,17 +2,19 @@
 
 Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) with dual fused CUDA megakernels for predictor and talker.
 
-## Performance (honest measurements — text encoding included)
+## Performance (honest measurements — 2026-03-20)
 
-| GPU | Path | TTFP codec raw | TTFP PCM | Notes |
-|-----|------|---------------|----------|-------|
-| **A100 SXM 80GB** | CUDA graph | **16ms** | **24ms** | Measured 2026-03-20, 250+ requests |
-| **H100 SXM** | Megakernel | **4.0ms** | **6.3ms** | Megakernel path (not retested yet) |
-| **RTX 5090** | Megakernel | **3.3ms** | **5.1ms** | Consumer card, megakernel path |
+| GPU | Path | TTFP codec raw | TTFP PCM | Stability |
+|-----|------|---------------|----------|-----------|
+| **H100 SXM** | MK predictor + CUDA graph talker | **4.4ms** | ~20ms | TTFP stable; generation hangs after ~20 frames (MK bug) |
+| **H100 SXM** | CUDA graph only | **14.8ms** | ~24ms | Fully stable |
+| **A100 SXM** | CUDA graph only | **16ms** | ~24ms | Fully stable, 250+ requests verified |
 
-TTFP = time from request receipt to first audio frame ready on GPU (after `.cpu()` sync). Text encoding is **not** pre-computed before the timer — it is architecturally deferred after the first frame because the first frame depends only on cached KV + sampling + predictor (text encoding is first needed for the second frame). Pipelined on a background CUDA stream to overlap with frame 1 network transfer.
+TTFP = time from request receipt to first codec frame ready on GPU (after `.cpu()` sync). Text encoding is architecturally **deferred after the first frame** — the first frame depends only on cached KV + sampling + predictor. Text encoding is pipelined on a background CUDA stream to overlap with frame 1 network transfer.
 
-> **Note:** RTX 5090 is a consumer card. For production, use datacenter GPUs (B200, H200, H100) for ECC memory and reliability. The megakernel path deadlocks on A100 (sm_80) — use CUDA graph path (`USE_MEGAKERNEL=0`) on A100.
+The bottleneck is `predictor_graph.run()` (14.4ms in CUDA graph mode, 17 sequential steps of a 5-layer transformer). The megakernel predictor reduces this to ~2ms but currently deadlocks after repeated calls in the generation loop.
+
+> **Note:** The megakernel deadlocks on A100 (sm_80) entirely. On H100 (sm_90), the predictor megakernel works for TTFP but hangs during sustained generation. Use `USE_MEGAKERNEL=0` for production until the megakernel loop bug is fixed. RTX 5090 is a consumer card — use datacenter GPUs (B200, H200, H100) for production.
 
 | Feature | Details |
 |---------|---------|
@@ -21,8 +23,8 @@ TTFP = time from request receipt to first audio frame ready on GPU (after `.cpu(
 | Tone presets | 8 (neutral, warm, soft, dynamic, calm, formal, joyful, authoritative) |
 | Pre-cached combos | **480** (voice x language x tone), zero-cost switching |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
-| Stability | 250/500 requests verified, 0 errors, 0 reconnects (A100 SXM) |
-| TTFP stability | Constant 1 word → 45 words (16ms ± 0ms codec raw). Text encoding deferred — not on critical path |
+| Stability | 250+ requests, 0 errors (CUDA graph path on A100 SXM) |
+| TTFP stability | Constant 1 word → 45 words. Text encoding deferred — architecturally not on critical path |
 | Audio quality | Cosine similarity 0.9995 vs CUDA graph baseline (numerically identical) |
 
 ## How it works
