@@ -1,733 +1,45 @@
-"""Qwen3-TTS server — production hardened, minimum TTFP."""
+"""Qwen3-TTS server — production hardened, minimum TTFP.
+
+Slim entry point: creates TTSEngine + ServerMonitor, wires up FastAPI.
+"""
 
 import gc
-import hmac
-import json
-import os
-import struct
-import time
-import threading
-from collections import OrderedDict
-
-import numpy as np
-import torch
 
 # Disable GC during generation to avoid pauses
 gc.disable()
 gc.collect()
 
-t0 = time.time()
-
-# ── Start cache loading from disk IMMEDIATELY (overlaps with everything) ──
-CACHE_PATH = "/workspace/prefill_cache.pt"
-_cache_cpu = [None]
-
-def _load_cache_bg():
-    if os.path.exists(CACHE_PATH):
-        _cache_cpu[0] = torch.load(CACHE_PATH, map_location="cpu", weights_only=False)
-
-cache_thread = threading.Thread(target=_load_cache_bg, daemon=True)
-cache_thread.start()
-
-# ── GPU optimizations ───────────────────────────────────────────────
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
-
-# ── Config ──────────────────────────────────────────────────────────
-MODEL_SIZE = os.environ.get("MODEL_SIZE", "1.7B")
-CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "1"))
-USE_CACHE = os.environ.get("USE_CACHE", "1") == "1"
-
-model_path = f"/workspace/models/Qwen3-TTS-12Hz-{MODEL_SIZE}-CustomVoice"
-if not os.path.exists(model_path):
-    model_path = f"Qwen/Qwen3-TTS-12Hz-{MODEL_SIZE}-CustomVoice"
-
-print(f"Loading {MODEL_SIZE} from {model_path}...")
-
-from faster_qwen3_tts import FasterQwen3TTS
-from faster_qwen3_tts.sampling import sample_logits
-
-# Monkey-patch to use low_cpu_mem_usage (10s faster model load)
-import qwen_tts
-_orig_from_pretrained = qwen_tts.Qwen3TTSModel.from_pretrained
-@classmethod
-def _fast_from_pretrained(cls, *args, **kwargs):
-    kwargs.setdefault("low_cpu_mem_usage", True)
-    return _orig_from_pretrained.__func__(cls, *args, **kwargs)
-qwen_tts.Qwen3TTSModel.from_pretrained = _fast_from_pretrained
-
-model = FasterQwen3TTS.from_pretrained(model_path)
-inner = model.model.model
-# Reduce graph warmup to 1 iteration
-model.predictor_graph._orig_capture = model.predictor_graph.capture
-model.talker_graph._orig_capture = model.talker_graph.capture
-def _fast_pred(num_warmup=1): model.predictor_graph._orig_capture(num_warmup=1)
-def _fast_talk(prefill_len=10, num_warmup=1): model.talker_graph._orig_capture(prefill_len=prefill_len, num_warmup=1)
-model.predictor_graph.capture = _fast_pred
-model.talker_graph.capture = _fast_talk
-
-print("CUDA graph capture...")
-model._warmup(10)
-
-# ── GPU capability check: disable megakernels on unsupported GPUs ──
-_gpu_cc = torch.cuda.get_device_capability()
-_gpu_arch = _gpu_cc[0] * 10 + _gpu_cc[1]
-_gpu_name = torch.cuda.get_device_name(0)
-
-if _gpu_arch < 90 and os.environ.get("USE_MEGAKERNEL", "0") == "1":
-    print(f"  GPU {_gpu_name} (sm_{_gpu_arch}) < sm_90: disabling megakernels")
-    os.environ["USE_MEGAKERNEL"] = "0"
-    os.environ["USE_TALKER_MK"] = "0"
-
-# ── Megakernel predictor (optional, ~1.9x faster) ─────────────────
-USE_MEGAKERNEL = os.environ.get("USE_MEGAKERNEL", "0") == "1"
-mk_predictor = None
-
-if USE_MEGAKERNEL:
-    try:
-        import sys as _sys
-        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-        import torch.nn.functional as _F
-        from deploy.industrial.model_tts import CodePredictorKernel
-
-        print("Building megakernel predictor...")
-        t_mk = time.time()
-
-        # Extract predictor weights from loaded model
-        talker = inner.talker
-        cp_model = talker.code_predictor.model
-        cp_state = cp_model.state_dict()
-        # Add non-model predictor weights
-        for name, param in talker.code_predictor.named_parameters():
-            if not name.startswith("model."):
-                cp_state[name] = param.data
-        embed_weight = talker.model.codec_embedding.weight.data
-
-        mk_kernel = CodePredictorKernel(
-            {"code_predictor": cp_state, "embed_weight": embed_weight},
-            device="cuda"
-        )
-
-        # Get projection weights
-        proj_w = talker.code_predictor.small_to_mtp_projection.weight.data
-        proj_b = getattr(talker.code_predictor.small_to_mtp_projection, "bias", None)
-        if proj_b is not None:
-            proj_b = proj_b.data
-
-        # Pre-project all codec embeddings (eliminates 16 of 17 projections per predict)
-        proj_embed_w = _F.linear(embed_weight.float(), proj_w.float(),
-                                 proj_b.float() if proj_b is not None else None).to(torch.bfloat16)
-        proj_codec = []
-        for g in range(mk_kernel.num_groups):
-            pe = _F.linear(mk_kernel.codec_embeddings[g].float(), proj_w.float(),
-                           proj_b.float() if proj_b is not None else None).to(torch.bfloat16)
-            proj_codec.append(pe)
-
-        class _MKPredictor:
-            def __init__(self, mk, pw, pb, proj_ew, proj_ce):
-                self.mk = mk
-                self.pw = pw.bfloat16()
-                self.pb = pb.bfloat16() if pb is not None else None
-                self.proj_ew = proj_ew      # Pre-projected [vocab, 1024]
-                self.proj_ce = proj_ce      # Pre-projected per-group [vocab, 1024]
-
-            def _proj(self, x):
-                return _F.linear(x.float(), self.pw.float(),
-                                 self.pb.float() if self.pb is not None else None).bfloat16()
-
-            @torch.no_grad()
-            def run(self, past_hidden, token_id):
-                """Replace model.predictor_graph.run(). Returns [15] codebook tokens."""
-                self.mk.reset()
-                self.mk._step_with_embed(self._proj(past_hidden.squeeze(0).squeeze(0)))
-                tok_buf = torch.tensor([token_id], dtype=torch.long, device="cuda")
-                self.mk._step_with_embed(_F.embedding(tok_buf, self.proj_ew).squeeze(0))
-                out = []
-                for g in range(self.mk.num_groups):
-                    logits = _F.linear(
-                        self.mk._norm_out.to(torch.bfloat16).unsqueeze(0),
-                        self.mk.lm_heads[g]).squeeze(0)
-                    t = logits.argmax(keepdim=True).long()
-                    out.append(t.squeeze())
-                    if g < self.mk.num_groups - 1:
-                        self.mk._step_with_embed(
-                            _F.embedding(t, self.proj_ce[g]).squeeze(0))
-                return torch.stack(out)
-
-        mk_predictor = _MKPredictor(mk_kernel, proj_w, proj_b, proj_embed_w, proj_codec)
-
-        # Warmup with deadlock watchdog (30s timeout)
-        dummy_h = torch.randn(1, 1, 2048, dtype=torch.bfloat16, device="cuda")
-        _warmup_ok = [False]
-        def _warmup_predictor():
-            for _ in range(3):
-                mk_predictor.run(dummy_h, 0)
-            torch.cuda.synchronize()
-            _warmup_ok[0] = True
-        _wt = threading.Thread(target=_warmup_predictor, daemon=True)
-        _wt.start()
-        _wt.join(timeout=30)
-        if not _warmup_ok[0]:
-            raise RuntimeError("Predictor megakernel warmup deadlocked (30s timeout)")
-        print(f"  Megakernel predictor ready ({time.time()-t_mk:.1f}s)")
-    except Exception as e:
-        print(f"  Megakernel FAILED: {e} — falling back to CUDA graph predictor")
-        mk_predictor = None
-
-# ── Talker megakernel (optional, ~3.25x faster) ───────────────────
-USE_TALKER_MK = os.environ.get("USE_TALKER_MK", "0") == "1"
-mk_talker = None
-
-if USE_TALKER_MK:
-    try:
-        import math as _math
-        t_tmk = time.time()
-
-        # Build talker kernel (HIDDEN=2048, INTERMEDIATE=6144, NUM_KV_HEADS=8)
-        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "industrial"))
-        from build_talker_megakernel import get_talker_extension
-        print("Building talker megakernel...")
-        get_talker_extension()
-
-        _TALKER_LAYERS = 28
-        _TALKER_HIDDEN = 2048
-        _TALKER_INTER = 6144
-        _TALKER_KV_HEADS = 8
-        _TALKER_HEAD_DIM = 128
-        _TALKER_Q_SIZE = 2048
-        _TALKER_MAX_SEQ = 2048
-
-        # Pack talker weights from loaded model
-        talker_obj = inner.talker
-        _tlw = []
-        for i in range(_TALKER_LAYERS):
-            layer = talker_obj.model.layers[i]
-            _tlw.extend([
-                layer.input_layernorm.weight.data.contiguous(),
-                layer.self_attn.q_proj.weight.data.contiguous(),
-                layer.self_attn.k_proj.weight.data.contiguous(),
-                layer.self_attn.v_proj.weight.data.contiguous(),
-                layer.self_attn.q_norm.weight.data.contiguous(),
-                layer.self_attn.k_norm.weight.data.contiguous(),
-                layer.self_attn.o_proj.weight.data.contiguous(),
-                layer.post_attention_layernorm.weight.data.contiguous(),
-                layer.mlp.gate_proj.weight.data.contiguous(),
-                layer.mlp.up_proj.weight.data.contiguous(),
-                layer.mlp.down_proj.weight.data.contiguous(),
-            ])
-        _tlw_packed = torch.empty(len(_tlw), dtype=torch.int64, device="cuda")
-        for i, w in enumerate(_tlw):
-            _tlw_packed[i] = w.data_ptr()
-        _tfn = talker_obj.model.norm.weight.data.contiguous()
-
-        # M-RoPE cos/sin tables (temporal rotation for first 48 dims, identity for rest)
-        _ROPE_THETA = 1000000.0
-        _MROPE_T = 24  # temporal pairs
-        _inv_freq_t = 1.0 / (_ROPE_THETA ** (torch.arange(0, _MROPE_T * 2, 2, dtype=torch.float32) / _TALKER_HEAD_DIM))
-        _positions = torch.arange(_TALKER_MAX_SEQ, dtype=torch.float32)
-        _cos_t = torch.ones(_TALKER_MAX_SEQ, _TALKER_HEAD_DIM, dtype=torch.float32)
-        _sin_t = torch.zeros(_TALKER_MAX_SEQ, _TALKER_HEAD_DIM, dtype=torch.float32)
-        for p in range(_TALKER_MAX_SEQ):
-            for i in range(_MROPE_T):
-                angle = _positions[p] * _inv_freq_t[i]
-                _cos_t[p, i] = torch.cos(angle)
-                _cos_t[p, i + _TALKER_HEAD_DIM // 2] = torch.cos(angle)
-                _sin_t[p, i] = torch.sin(angle)
-                _sin_t[p, i + _TALKER_HEAD_DIM // 2] = torch.sin(angle)
-        _cos_t = _cos_t.to(torch.bfloat16).to("cuda").contiguous()
-        _sin_t = _sin_t.to(torch.bfloat16).to("cuda").contiguous()
-
-        class _MKTalker:
-            def __init__(self):
-                dev = "cuda"
-                f32 = dict(dtype=torch.float32, device=dev)
-                bf16 = dict(dtype=torch.bfloat16, device=dev)
-                self.k_cache = torch.zeros(_TALKER_LAYERS, _TALKER_KV_HEADS, _TALKER_MAX_SEQ, _TALKER_HEAD_DIM, **bf16)
-                self.v_cache = torch.zeros_like(self.k_cache)
-                self.hidden_buf = torch.empty(_TALKER_HIDDEN, **bf16)
-                self.act_buf = torch.empty(_TALKER_HIDDEN, **f32)
-                self.res_buf = torch.empty(_TALKER_HIDDEN, **f32)
-                self.q_buf = torch.empty(_TALKER_Q_SIZE, **f32)
-                self.k_buf = torch.empty(_TALKER_KV_HEADS * _TALKER_HEAD_DIM, **f32)
-                self.v_buf = torch.empty(_TALKER_KV_HEADS * _TALKER_HEAD_DIM, **f32)
-                self.attn_buf = torch.empty(_TALKER_Q_SIZE, **f32)
-                self.mlp_buf = torch.empty(_TALKER_INTER, **f32)
-                self.norm_buf = torch.empty(_TALKER_HIDDEN, **f32)
-                self.bmax_vals = torch.empty(4096, **f32)
-                self.bmax_idxs = torch.empty(4096, dtype=torch.int32, device=dev)
-                self.out_token = torch.empty(1, dtype=torch.int32, device=dev)
-                self.dummy_embed = torch.zeros(3072, _TALKER_HIDDEN, **bf16)
-                self.dummy_lm = torch.zeros(3072, _TALKER_HIDDEN, **bf16)
-                self.attn_scale = 1.0 / _math.sqrt(_TALKER_HEAD_DIM)
-                self._layer_weights = _tlw  # prevent GC
-
-            def step(self, embed_bf16, position):
-                self.hidden_buf.copy_(embed_bf16.view(-1))
-                torch.ops.qwen_megakernel_talker_C.decode(
-                    self.out_token, -1,
-                    self.dummy_embed, _tlw_packed, _tfn, self.dummy_lm,
-                    _cos_t, _sin_t,
-                    self.k_cache, self.v_cache,
-                    self.hidden_buf, self.act_buf, self.res_buf,
-                    self.q_buf, self.k_buf, self.v_buf,
-                    self.attn_buf, self.mlp_buf, self.norm_buf,
-                    self.bmax_vals, self.bmax_idxs,
-                    _TALKER_LAYERS, position, _TALKER_MAX_SEQ, self.attn_scale,
-                )
-
-            def restore_kv(self, tc_kv, prefill_len):
-                self.k_cache.zero_()
-                self.v_cache.zero_()
-                for layer_idx, (k, v) in enumerate(tc_kv):
-                    # k: [1, num_kv_heads, seq_len, head_dim]
-                    self.k_cache[layer_idx, :, :prefill_len, :].copy_(k.squeeze(0)[:, :prefill_len, :])
-                    self.v_cache[layer_idx, :, :prefill_len, :].copy_(v.squeeze(0)[:, :prefill_len, :])
-
-        mk_talker = _MKTalker()
-        dummy_ie = torch.randn(1, 1, _TALKER_HIDDEN, dtype=torch.bfloat16, device="cuda")
-        _talker_ok = [False]
-        def _warmup_talker():
-            for _ in range(3):
-                mk_talker.step(dummy_ie, 0)
-            torch.cuda.synchronize()
-            _talker_ok[0] = True
-        _tt = threading.Thread(target=_warmup_talker, daemon=True)
-        _tt.start()
-        _tt.join(timeout=30)
-        if not _talker_ok[0]:
-            raise RuntimeError("Talker megakernel warmup deadlocked (30s timeout)")
-        print(f"  Talker megakernel ready ({time.time()-t_tmk:.1f}s)")
-    except Exception as e:
-        print(f"  Talker megakernel FAILED: {e} — falling back to CUDA graph")
-        mk_talker = None
-
-import torch.nn.functional as F_global
-
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-
-app = FastAPI(title="Qwen3-TTS")
-
-cached_suppress_mask = None
-cached_eos_id = None
-
-# ── Presets: voices × languages × tones ──────────────────────────────
-TONE_PRESETS = [
-    "", "Parle d'un ton chaleureux et professionnel",
-    "Voix douce et rassurante", "Ton dynamique et enthousiaste",
-    "Parle calmement avec empathie", "Ton sérieux et formel",
-    "Voix joyeuse et souriante", "Parle avec autorité et confiance",
-]
-
-CACHE_VOICES = os.environ.get("CACHE_VOICES", "Vivian,Serena,Dylan,Eric,Ryan,Aiden").split(",")
-CACHE_LANGUAGES = os.environ.get("CACHE_LANGUAGES", "French,English,Chinese,Japanese,Korean,German,Russian,Portuguese,Spanish,Italian").split(",")
-CACHE_TONES = os.environ.get("CACHE_TONES", ",".join(TONE_PRESETS)).split("|") if os.environ.get("CACHE_TONES") else TONE_PRESETS
-
-if USE_CACHE:
-    # Pre-cache talker references
-    cached_talker = inner.talker
-    cached_talker_codec_embed = cached_talker.get_input_embeddings()
-    cached_talker_codec_head = cached_talker.codec_head
-    cached_predictor_embeds = cached_talker.code_predictor.get_input_embeddings()
-
-    _, _, config, _, _, _, _ = model._prepare_generation_custom(
-        text="Test.", language="French", speaker="Vivian", instruct=""
-    )
-    cached_eos_id = config.codec_eos_token_id
-    cached_num_code_groups = config.num_code_groups
-    cached_rope_deltas = getattr(cached_talker, "rope_deltas", None)
-    vocab_size = config.vocab_size
-    device = next(cached_talker.parameters()).device
-
-    cached_suppress_mask = torch.zeros(vocab_size, dtype=torch.bool, device=device)
-    suppress_start = max(0, vocab_size - 1024)
-    for i in range(suppress_start, vocab_size):
-        if i != cached_eos_id:
-            cached_suppress_mask[i] = True
-
-    cached_suppress_list = [cached_eos_id]
-
-    with torch.inference_mode():
-        cached_tts_eos_embed = cached_talker.text_projection(
-            cached_talker.get_text_embeddings()(
-                torch.tensor([[inner.config.tts_eos_token_id]], device=device, dtype=torch.long)
-            )
-        )
-
-    # ── Full KV cache: (voice, language, instruct) → prefill state ──
-    prefill_cache = {}
-
-    # Wait for background cache load to finish
-    cache_thread.join()
-    raw_cache = _cache_cpu[0]
-
-    def _build_one(voice_name, lang_name, instruct_str):
-        m, talker, cfg, tie, tam, tth_dummy, tpe = model._prepare_generation_custom(
-            text="Test.", language=lang_name, speaker=voice_name,
-            instruct=instruct_str if instruct_str else None,
-        )
-        with torch.inference_mode():
-            out = talker.forward(
-                inputs_embeds=tie, attention_mask=tam,
-                use_cache=True, output_hidden_states=True, return_dict=True,
-                trailing_text_hidden=tth_dummy, tts_pad_embed=tpe,
-                generation_step=None, past_hidden=None, past_key_values=None,
-            )
-            return {
-                "kv": tuple(tuple(t.clone().cpu() for t in layer) for layer in out.past_key_values),
-                "logits": out.logits[:, -1, :].clone().cpu(),
-                "past_hidden": out.past_hidden.clone().cpu(),
-                "gen_step": out.generation_step,
-                "tam": tam.clone().cpu(),
-                "tpe": tpe.clone().cpu(),
-                "prefill_len": out.past_key_values[0][0].shape[2],
-            }
-
-    # Use pre-loaded cache from background thread
-    if raw_cache is not None:
-        print(f"Moving pre-loaded KV caches to GPU...")
-        t_load = time.time()
-        for key_str, state in raw_cache.items():
-            key = tuple(key_str.split("|||"))
-            prefill_cache[key] = {
-                "kv": tuple(tuple(t.to(device) for t in layer) for layer in state["kv"]),
-                "logits": state["logits"].to(device),
-                "past_hidden": state["past_hidden"].to(device),
-                "gen_step": state["gen_step"],
-                "tam": state["tam"].to(device),
-                "tpe": state["tpe"].to(device),
-                "prefill_len": state["prefill_len"],
-            }
-        print(f"  Loaded {len(prefill_cache)} combos in {time.time()-t_load:.1f}s")
-    else:
-        # Build from scratch and save to disk
-        n_combos = len(CACHE_VOICES) * len(CACHE_LANGUAGES) * len(CACHE_TONES)
-        print(f"Building KV caches: {len(CACHE_VOICES)} voices × {len(CACHE_LANGUAGES)} langs × {len(CACHE_TONES)} tones = {n_combos}...")
-        t_build = time.time()
-
-        for voice in CACHE_VOICES:
-            for lang in CACHE_LANGUAGES:
-                for instruct_str in CACHE_TONES:
-                    key = (voice.strip(), lang.strip(), instruct_str.strip())
-                    try:
-                        prefill_cache[key] = _build_one(*key)
-                        # Move to GPU
-                        state = prefill_cache[key]
-                        state["kv"] = tuple(tuple(t.to(device) for t in layer) for layer in state["kv"])
-                        state["logits"] = state["logits"].to(device)
-                        state["past_hidden"] = state["past_hidden"].to(device)
-                        state["tam"] = state["tam"].to(device)
-                        state["tpe"] = state["tpe"].to(device)
-                    except Exception as e:
-                        print(f"  SKIP {key}: {e}")
-
-        print(f"  Built {len(prefill_cache)} combos in {time.time()-t_build:.1f}s")
-
-        # Save to disk for next startup
-        print(f"  Saving to {CACHE_PATH}...")
-        save_data = {}
-        for key, state in prefill_cache.items():
-            key_str = "|||".join(key)
-            save_data[key_str] = {
-                "kv": tuple(tuple(t.cpu() for t in layer) for layer in state["kv"]),
-                "logits": state["logits"].cpu(),
-                "past_hidden": state["past_hidden"].cpu(),
-                "gen_step": state["gen_step"],
-                "tam": state["tam"].cpu(),
-                "tpe": state["tpe"].cpu(),
-                "prefill_len": state["prefill_len"],
-            }
-        torch.save(save_data, CACHE_PATH)
-        print(f"  Saved ({os.path.getsize(CACHE_PATH)/1024/1024:.0f}MB)")
-
-    sample_kv = next(iter(prefill_cache.values()))["kv"]
-    kv_bytes = sum(t.numel()*t.element_size() for l in sample_kv for t in l)
-    print(f"  {len(prefill_cache)} combos cached, {kv_bytes/1024/1024:.1f}MB each, {kv_bytes*len(prefill_cache)/1024/1024:.0f}MB total")
-
-
-_tth_cache = OrderedDict()  # text → tth tensor, true LRU, max 200 entries
-_TTH_CACHE_MAX = 200
-
-@torch.inference_mode()
-def _compute_tth(text):
-    """Compute trailing_text_hiddens with LRU cache."""
-    cached = _tth_cache.get(text)
-    if cached is not None:
-        _tth_cache.move_to_end(text)
-        return cached
-    input_texts = [model.model._build_assistant_text(text)]
-    input_ids = model.model._tokenize_texts(input_texts)[0]
-    if input_ids.shape[1] < 9:
-        text_tokens = input_ids
-    else:
-        text_tokens = input_ids[:, 4:-5]
-    tth = cached_talker.text_projection(
-        cached_talker.get_text_embeddings()(text_tokens))
-    result = torch.cat((tth, cached_tts_eos_embed), dim=1)
-    if len(_tth_cache) >= _TTH_CACHE_MAX:
-        _tth_cache.popitem(last=False)
-    _tth_cache[text] = result
-    return result
-
-
-_last_cache_key = [None]  # Track last KV combo loaded in static cache
-
-_tth_stream = torch.cuda.Stream()
-
-
-@torch.inference_mode()
-def generate_cached_codec(text, voice="Vivian", language="French",
-                           instruct="", chunk_size=1):
-    """
-    Yield raw codec token tensors (no speech_tokenizer decode).
-    Selects the right KV cache based on instruct/tone.
-    Skips KV restore if same combo as last request.
-
-    TTFP architecture: text encoding (tth) is deferred to after the first
-    yield because the first frame depends only on cached KV + sampling +
-    predictor megakernel. tth is first read at L+19 to build inputs_embeds
-    for the SECOND talker step. We pipeline it on a background CUDA stream
-    so the GPU projection overlaps with the first frame's network transfer.
-    """
-    # Normalize instruct for cache lookup (handle missing accents etc.)
-    inst = instruct or ""
-    cache_key = (voice, language, inst)
-    tc = prefill_cache.get(cache_key)
-    if tc is None:
-        # Fuzzy match: strip accents and compare
-        import unicodedata as _ud
-        def _strip(s, _n=_ud.normalize):
-            return _n("NFD", s).encode("ascii", "ignore").decode()
-        stripped = _strip(inst)
-        for k, v in prefill_cache.items():
-            if k[0] == voice and k[1] == language and _strip(k[2]) == stripped:
-                tc = v
-                cache_key = k
-                break
-        if tc is None:
-            tc = prefill_cache.get((voice, language, ""))
-            cache_key = (voice, language, "")
-        if tc is None:
-            tc = prefill_cache[("Vivian", "French", "")]
-            cache_key = ("Vivian", "French", "")
-    tc_kv = tc["kv"]
-    tc_logits = tc["logits"]
-    tc_past_hidden = tc["past_hidden"]
-    tc_gen_step = tc["gen_step"]
-    tc_tam = tc["tam"]
-    tc_tpe = tc["tpe"]
-    tc_prefill_len = tc["prefill_len"]
-
-    # tth is NOT computed here — deferred to after the first yield.
-
-    # Skip KV restore if same combo as last request
-    if _last_cache_key[0] != cache_key:
-        if mk_talker is not None:
-            mk_talker.restore_kv(tc_kv, tc_prefill_len)
-        else:
-            for layer_idx, (k, v) in enumerate(tc_kv):
-                model.talker_graph.static_cache.update(k, v, layer_idx)
-        _last_cache_key[0] = cache_key
-    if mk_talker is None:
-        model.talker_graph.set_generation_state(tc_tam, cached_rope_deltas)
-
-    token = sample_logits(
-        tc_logits, temperature=0.9, top_k=50, top_p=1.0,
-        do_sample=True, suppress_mask=cached_suppress_mask,
-        suppress_tokens=cached_suppress_list,
-    )
-
-    past_hidden = tc_past_hidden.clone()
-    gen_step = tc_gen_step
-    tth_new = None
-    tth_event = None
-
-    for step_idx in range(2048):
-        if token.item() == cached_eos_id:
-            break
-
-        last_id_hidden = cached_talker_codec_embed(token.unsqueeze(1))
-        if mk_predictor is not None:
-            codebook_token_ids = mk_predictor.run(past_hidden, token.item())
-        else:
-            pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-            codebook_token_ids = model.predictor_graph.run(pred_input)
-        all_cb = torch.cat([token.view(1), codebook_token_ids])
-
-        # Pipeline tth: kick off on background CUDA stream BEFORE yield.
-        # CPU tokenization runs now (~0.3ms); GPU projection dispatches to
-        # _tth_stream and overlaps with the caller's .cpu() + network send.
-        if tth_new is None and tth_event is None:
-            cached_tth = _tth_cache.get(text)
-            if cached_tth is not None:
-                tth_new = cached_tth
-            else:
-                tth_event = torch.cuda.Event()
-                with torch.cuda.stream(_tth_stream):
-                    tth_new = _compute_tth(text)
-                    tth_event.record()
-
-        yield all_cb  # TTFP: only KV restore + sample + predictor
-
-        # Sync background stream before reading tth_new
-        if tth_event is not None:
-            tth_event.synchronize()
-            tth_event = None
-
-        codec_hiddens = [last_id_hidden]
-        for ci in range(cached_num_code_groups - 1):
-            codec_hiddens.append(cached_predictor_embeds[ci](
-                codebook_token_ids[ci].unsqueeze(0).unsqueeze(0)))
-        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
-
-        if gen_step < tth_new.shape[1]:
-            inputs_embeds = inputs_embeds + tth_new[:, gen_step].unsqueeze(1)
-        else:
-            inputs_embeds = inputs_embeds + tc_tpe
-
-        current_pos = tc_prefill_len + step_idx
-        max_pos = _TALKER_MAX_SEQ - 1 if mk_talker is not None else model.talker_graph.max_seq_len - 1
-        if current_pos >= max_pos:
-            break
-
-        if mk_talker is not None:
-            mk_talker.step(inputs_embeds, current_pos)
-            norm_bf16 = mk_talker.norm_buf.to(torch.bfloat16)
-            logits = F_global.linear(norm_bf16.unsqueeze(0), cached_talker_codec_head.weight).unsqueeze(0)
-            past_hidden = norm_bf16.unsqueeze(0).unsqueeze(0)
-        else:
-            hidden_states = model.talker_graph.run(inputs_embeds, position=current_pos)
-            logits = cached_talker_codec_head(hidden_states[:, -1, :]).unsqueeze(0)
-            past_hidden = hidden_states[:, -1:, :].clone()
-
-        token = sample_logits(
-            logits.squeeze(0), temperature=0.9, top_k=50, top_p=1.0,
-            do_sample=True, suppress_mask=cached_suppress_mask,
-        )
-        gen_step += 1
-
-
-@torch.inference_mode()
-def generate_cached_streaming(text, voice="Vivian", language="French",
-                               instruct="", chunk_size=1):
-    """Streaming generation with cached prefill KV + speech decode."""
-    speech_tokenizer = inner.speech_tokenizer
-    all_codes = []
-    prev_audio_len = 0
-    samples_per_frame = None
-    context_frames = 25
-    chunk_buffer = []
-
-    for codec_ids in generate_cached_codec(text, voice, language, instruct, chunk_size):
-        chunk_buffer.append(codec_ids.detach())
-
-        if len(chunk_buffer) >= chunk_size:
-            chunk_codes = torch.stack(chunk_buffer)
-            all_codes.append(chunk_codes)
-            all_flat = torch.cat(all_codes, dim=0)
-            n_new = chunk_codes.shape[0]
-            n_total = all_flat.shape[0]
-
-            if samples_per_frame is None:
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": all_flat.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                new_audio = audio[prev_audio_len:]
-                prev_audio_len = len(audio)
-                if n_total >= max(context_frames, chunk_size):
-                    samples_per_frame = len(audio) / n_total
-            else:
-                ctx_start = max(0, n_total - n_new - context_frames)
-                window = all_flat[ctx_start:]
-                n_ctx = window.shape[0] - n_new
-                audio_list, sr = speech_tokenizer.decode(
-                    {"audio_codes": window.unsqueeze(0)})
-                audio = audio_list[0]
-                if hasattr(audio, "cpu"):
-                    audio = audio.flatten().cpu().numpy()
-                if n_ctx > 0:
-                    ctx_samples = int(round(n_ctx * samples_per_frame))
-                    new_audio = audio[ctx_samples:]
-                else:
-                    new_audio = audio
-
-            yield new_audio, sr
-            chunk_buffer = []
-
-    if chunk_buffer:
-        chunk_codes = torch.stack(chunk_buffer)
-        all_codes.append(chunk_codes)
-        all_flat = torch.cat(all_codes, dim=0)
-        audio_list, sr = speech_tokenizer.decode(
-            {"audio_codes": all_flat.unsqueeze(0)})
-        audio = audio_list[0]
-        if hasattr(audio, "cpu"):
-            audio = audio.flatten().cpu().numpy()
-        new_audio = audio[prev_audio_len:]
-        yield new_audio, sr
-
-
-# ── Prime the pipeline (1 cached codec call to warm GPU caches) ──────
-cached_ttfp_ms = -1
-
-if USE_CACHE and prefill_cache:
-    # First call primes everything — discard timing
-    for _ in generate_cached_codec("Test."):
-        break
-    # Honest TTFP: fresh text, tth NOT pre-cached, deferred inside generator.
-    # The generator pipelines tth on a background CUDA stream after the first
-    # yield, so the TTFP only reflects: KV restore + sample + predictor.
-    # This is honest because tth genuinely isn't needed for the first frame.
-    _ttfp_text = "Bienvenue, comment puis-je vous aider aujourd'hui ?"
-    _tth_cache.pop(_ttfp_text, None)  # ensure not cached
-    torch.cuda.synchronize()
-    t_s = time.perf_counter()
-    for cb in generate_cached_codec(_ttfp_text):
-        _ = cb.cpu()  # Force GPU sync for honest measurement
-        cached_ttfp_ms = (time.perf_counter() - t_s) * 1000
-        break
-
-print(f"\nModel loaded + warmed up in {time.time()-t0:.1f}s")
-print(f"  Cached TTFP: {cached_ttfp_ms:.1f}ms")
-
-# Pre-download Base model in background (so first clone doesn't wait for download)
-def _predownload_base():
-    base_path = model_path.replace("CustomVoice", "Base")
-    if not os.path.exists(base_path):
-        from huggingface_hub import snapshot_download
-        base_id = f"Qwen/Qwen3-TTS-12Hz-{MODEL_SIZE}-Base"
-        snapshot_download(base_id, local_dir=base_path, ignore_patterns=["*.md"])
-        print("Base model pre-downloaded for cloning")
-
-threading.Thread(target=_predownload_base, daemon=True).start()
-
 import asyncio
 import base64
 import concurrent.futures
+import hmac
+import json
+import os
+import struct
 import tempfile
+import time
+
+import numpy as np
+import torch
+
+from server.engine import TTSEngine
+from server.monitoring import ServerMonitor
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+
+# ── Create engine and monitor ──────────────────────────────────────────
+engine = TTSEngine()
+monitor = ServerMonitor(engine)
+
+app = FastAPI(title="Qwen3-TTS")
 
 API_KEY = os.environ.get("TTS_API_KEY", "")
-_request_count = 0
 _gc_interval = 100
 
-# ── Runtime monitoring & auto-fallback ────────────────────────────────
-_GENERATION_TIMEOUT = float(os.environ.get("GENERATION_TIMEOUT", "60"))
-_FRAME_TIMEOUT = float(os.environ.get("FRAME_TIMEOUT", "10"))
-_MK_FAILURE_THRESHOLD = 3
-
-_mk_runtime_failures = 0
-_server_degraded = False
-_total_errors = 0
-_ttfp_history = []  # last 100 TTFP values for percentile tracking
-_TTFP_HISTORY_MAX = 100
-_last_frame_time = [time.monotonic()]
-_generation_active = [False]
-
 # Thread pool for async generation (run_in_executor)
-_gen_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="gen")
+_gen_pool = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2, thread_name_prefix="gen"
+)
 _GEN_SENTINEL = object()  # signals StopIteration across executor boundary
 
 
@@ -743,227 +55,8 @@ def _safe_next(gen_iter):
         return _GEN_SENTINEL
 
 
-def _auto_disable_megakernel():
-    """Disable predictor megakernel at runtime after repeated failures."""
-    global mk_predictor, _server_degraded
-    if mk_predictor is not None:
-        print(f"AUTO-FALLBACK: Disabling megakernel predictor after {_MK_FAILURE_THRESHOLD} runtime failures",
-              flush=True)
-        mk_predictor = None
-        _server_degraded = True
-
-
-# ── Couche 2: in-process watchdog — force exit on stuck generation ────
-def _deadlock_watchdog():
-    """Background thread: force-exit if generation is stuck beyond timeout.
-
-    This catches cases where the async timeout (couche 1) is bypassed,
-    e.g. if the event loop itself is blocked or the executor thread
-    holds the GIL during a CUDA deadlock.
-    """
-    GRACE = 5  # extra seconds beyond FRAME_TIMEOUT before hard kill
-    while True:
-        time.sleep(2)
-        if _generation_active[0]:
-            elapsed = time.monotonic() - _last_frame_time[0]
-            if elapsed > _FRAME_TIMEOUT + GRACE:
-                print(f"WATCHDOG: Generation stuck {elapsed:.0f}s "
-                      f"(limit {_FRAME_TIMEOUT + GRACE:.0f}s). Force exit.",
-                      flush=True)
-                os._exit(1)  # Hard exit — start.sh restart loop picks up
-
-
-threading.Thread(target=_deadlock_watchdog, daemon=True, name="deadlock-watchdog").start()
-
-# ── Voice clone: lazy-loaded Base model + prefix KV cache per voice ───
-_clone_model = None
-_clone_cache = {}          # clone_id → ref_audio path
-_clone_prefill = {}        # clone_id → {kv, logits, past_hidden, gen_step, tam, tpe, prefill_len}
-_clone_refs = {}           # Cached clone model references
-_clone_last_key = [None]   # Track last clone KV loaded
-
-def _get_clone_model():
-    """Lazy-load the Base model for voice cloning (first call only)."""
-    global _clone_model
-    if _clone_model is not None:
-        return _clone_model
-    print("Loading Base model for voice cloning...")
-    t0 = time.time()
-    base_path = model_path.replace("CustomVoice", "Base")
-    if not os.path.exists(base_path):
-        from huggingface_hub import snapshot_download
-        base_id = f"Qwen/Qwen3-TTS-12Hz-{MODEL_SIZE}-Base"
-        snapshot_download(base_id, local_dir=base_path, ignore_patterns=["*.md"])
-    _clone_model = FasterQwen3TTS.from_pretrained(base_path)
-    _clone_model._warmup(10)
-
-    # Cache references for fast codec generation
-    clone_inner = _clone_model.model.model
-    clone_talker = clone_inner.talker
-    _clone_refs["talker"] = clone_talker
-    _clone_refs["codec_embed"] = clone_talker.get_input_embeddings()
-    _clone_refs["codec_head"] = clone_talker.codec_head
-    _clone_refs["pred_embeds"] = clone_talker.code_predictor.get_input_embeddings()
-    _clone_refs["eos_id"] = cached_eos_id  # Same tokenizer
-    _clone_refs["num_code_groups"] = cached_num_code_groups
-    _clone_refs["rope_deltas"] = getattr(clone_talker, "rope_deltas", None)
-    _clone_refs["suppress_mask"] = cached_suppress_mask  # Same vocab
-    # Compute tts_eos_embed for the Base model
-    with torch.inference_mode():
-        _clone_refs["tts_eos_embed"] = clone_talker.text_projection(
-            clone_talker.get_text_embeddings()(
-                torch.tensor([[clone_inner.config.tts_eos_token_id]], device=device, dtype=torch.long)
-            )
-        )
-    print(f"  Base model loaded in {time.time()-t0:.1f}s")
-    return _clone_model
-
-
-def _build_clone_prefill(clone_id, ref_audio, ref_text, language="French"):
-    """Build and cache the KV prefill for a cloned voice."""
-    cm = _get_clone_model()
-    result = cm._prepare_generation(
-        text="Test.", ref_audio=ref_audio, ref_text=ref_text, language=language,
-    )
-    m, talker, config, tie, tam, tth_dummy, tpe = result[:7]
-    with torch.inference_mode():
-        out = talker.forward(
-            inputs_embeds=tie, attention_mask=tam,
-            use_cache=True, output_hidden_states=True, return_dict=True,
-            trailing_text_hidden=tth_dummy, tts_pad_embed=tpe,
-            generation_step=None, past_hidden=None, past_key_values=None,
-        )
-        _clone_prefill[clone_id] = {
-            "kv": tuple(tuple(t.clone() for t in layer) for layer in out.past_key_values),
-            "logits": out.logits[:, -1, :].clone(),
-            "past_hidden": out.past_hidden.clone(),
-            "gen_step": out.generation_step,
-            "tam": tam.clone(),
-            "tpe": tpe.clone(),
-            "prefill_len": out.past_key_values[0][0].shape[2],
-        }
-    # Warmup the clone codec path to match CustomVoice performance
-    for _ in range(5):
-        for _ in generate_clone_cached_codec("Test.", clone_id, language):
-            break
-    return _clone_prefill[clone_id]
-
-
-_clone_tth_cache = OrderedDict()
-
-@torch.inference_mode()
-def _compute_clone_tth(text):
-    """Compute trailing_text_hiddens using the Base model's text encoder."""
-    cached = _clone_tth_cache.get(text)
-    if cached is not None:
-        _clone_tth_cache.move_to_end(text)
-        return cached
-    cm = _get_clone_model()
-    input_texts = [cm.model._build_assistant_text(text)]
-    input_ids = cm.model._tokenize_texts(input_texts)[0]
-    if input_ids.shape[1] < 9:
-        text_tokens = input_ids
-    else:
-        text_tokens = input_ids[:, 4:-5]
-    tth = _clone_refs["talker"].text_projection(
-        _clone_refs["talker"].get_text_embeddings()(text_tokens))
-    result = torch.cat((tth, _clone_refs["tts_eos_embed"]), dim=1)
-    if len(_clone_tth_cache) >= _TTH_CACHE_MAX:
-        _clone_tth_cache.popitem(last=False)
-    _clone_tth_cache[text] = result
-    return result
-
-
-_clone_tth_stream = torch.cuda.Stream()
-
-
-@torch.inference_mode()
-def generate_clone_cached_codec(text, clone_id, language="French"):
-    """Fast clone codec generation using cached KV (same pattern as CustomVoice).
-
-    tth deferred to after first yield — same pipeline as generate_cached_codec.
-    """
-    tc = _clone_prefill.get(clone_id)
-    if tc is None:
-        raise ValueError(f"Clone '{clone_id}' not found. Send ref_audio first.")
-
-    cm = _get_clone_model()
-
-    # Restore KV to clone model's static cache
-    if _clone_last_key[0] != clone_id:
-        for layer_idx, (k, v) in enumerate(tc["kv"]):
-            cm.talker_graph.static_cache.update(k, v, layer_idx)
-        cm.talker_graph.set_generation_state(tc["tam"], _clone_refs["rope_deltas"])
-        _clone_last_key[0] = clone_id
-    else:
-        cm.talker_graph.set_generation_state(tc["tam"], _clone_refs["rope_deltas"])
-
-    token = sample_logits(
-        tc["logits"], temperature=0.9, top_k=50, top_p=1.0,
-        do_sample=True, suppress_mask=_clone_refs["suppress_mask"],
-        suppress_tokens=cached_suppress_list,
-    )
-
-    past_hidden = tc["past_hidden"].clone()
-    gen_step = tc["gen_step"]
-    eos_id = _clone_refs["eos_id"]
-    codec_embed = _clone_refs["codec_embed"]
-    codec_head = _clone_refs["codec_head"]
-    pred_embeds = _clone_refs["pred_embeds"]
-    num_cg = _clone_refs["num_code_groups"]
-    tth_new = None
-    tth_event = None
-
-    for step_idx in range(2048):
-        if token.item() == eos_id:
-            break
-        last_id_hidden = codec_embed(token.unsqueeze(1))
-        pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
-        codebook_token_ids = cm.predictor_graph.run(pred_input)
-        all_cb = torch.cat([token.view(1), codebook_token_ids])
-
-        # Pipeline tth on background stream (same pattern as CustomVoice)
-        if tth_new is None and tth_event is None:
-            cached_tth = _clone_tth_cache.get(text)
-            if cached_tth is not None:
-                tth_new = cached_tth
-            else:
-                tth_event = torch.cuda.Event()
-                with torch.cuda.stream(_clone_tth_stream):
-                    tth_new = _compute_clone_tth(text)
-                    tth_event.record()
-
-        yield all_cb
-
-        if tth_event is not None:
-            tth_event.synchronize()
-            tth_event = None
-
-        codec_hiddens = [last_id_hidden]
-        for ci in range(num_cg - 1):
-            codec_hiddens.append(pred_embeds[ci](codebook_token_ids[ci].unsqueeze(0).unsqueeze(0)))
-        inputs_embeds = torch.cat(codec_hiddens, dim=1).sum(1, keepdim=True)
-        if gen_step < tth_new.shape[1]:
-            inputs_embeds = inputs_embeds + tth_new[:, gen_step].unsqueeze(1)
-        else:
-            inputs_embeds = inputs_embeds + tc["tpe"]
-
-        current_pos = tc["prefill_len"] + step_idx
-        if current_pos >= cm.talker_graph.max_seq_len - 1:
-            break
-        hidden_states = cm.talker_graph.run(inputs_embeds, position=current_pos)
-        logits = codec_head(hidden_states[:, -1, :]).unsqueeze(0)
-        token = sample_logits(
-            logits.squeeze(0), temperature=0.9, top_k=50, top_p=1.0,
-            do_sample=True, suppress_mask=_clone_refs["suppress_mask"],
-        )
-        past_hidden = hidden_states[:, -1:, :].clone()
-        gen_step += 1
-
-
 @app.websocket("/ws/tts")
 async def websocket_tts(ws: WebSocket):
-    global _request_count
     await ws.accept()
     disconnected = False
 
@@ -1001,7 +94,7 @@ async def websocket_tts(ws: WebSocket):
         voice = req.get("voice", "Vivian")
         language = req.get("language", "French")
         instruct = req.get("instruct", "")
-        cs = max(1, min(16, int(req.get("chunk_size", CHUNK_SIZE))))
+        cs = max(1, min(16, int(req.get("chunk_size", engine.CHUNK_SIZE))))
         codec_mode = req.get("codec", False)
 
         # Voice cloning params
@@ -1020,7 +113,13 @@ async def websocket_tts(ws: WebSocket):
             continue
         if len(text) > MAX_TEXT_LEN:
             try:
-                await ws.send_text(json.dumps({"error": f"text too long ({len(text)} > {MAX_TEXT_LEN})"}))
+                await ws.send_text(
+                    json.dumps(
+                        {
+                            "error": f"text too long ({len(text)} > {MAX_TEXT_LEN})"
+                        }
+                    )
+                )
             except (WebSocketDisconnect, Exception):
                 break
             continue
@@ -1034,11 +133,9 @@ async def websocket_tts(ws: WebSocket):
         chunk_count = 0
         ttfp_ms = 0
         sr = 24000
-        _request_count += 1
+        monitor.request_count += 1
 
-        # TTFP timer: text encoding is deferred inside generators (pipelined
-        # on a background CUDA stream, overlapping with first frame transfer).
-        # The timer captures the true end-to-end latency the client sees.
+        # TTFP timer
         torch.cuda.synchronize()
         t0_req = time.perf_counter()
 
@@ -1046,7 +143,6 @@ async def websocket_tts(ws: WebSocket):
         if ref_audio_b64 or clone_id:
             # Voice cloning mode
             if ref_audio_b64:
-                # First call: save ref audio, build prefill cache
                 audio_bytes = base64.b64decode(ref_audio_b64)
                 tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                 ref_path = tmp.name
@@ -1057,43 +153,63 @@ async def websocket_tts(ws: WebSocket):
                     tmp.close()
                     os.unlink(ref_path)
                     raise
-                cid = clone_id or f"_auto_{_request_count}"
-                _clone_cache[cid] = ref_path
-                _build_clone_prefill(cid, ref_path, ref_text, language)
-                # Use slow path for first generation (prefill just computed)
-                clone_model = _get_clone_model()
+                cid = clone_id or f"_auto_{monitor.request_count}"
+                engine._clone_cache[cid] = ref_path
+                engine.build_clone_prefill(cid, ref_path, ref_text, language)
+                clone_model = engine._get_clone_model()
                 gen = clone_model.generate_voice_clone_streaming(
-                    text=text, language=language, ref_audio=ref_path,
-                    ref_text=ref_text, chunk_size=cs)
+                    text=text,
+                    language=language,
+                    ref_audio=ref_path,
+                    ref_text=ref_text,
+                    chunk_size=cs,
+                )
                 codec_mode = False
-            elif clone_id and clone_id in _clone_prefill:
-                # Fast path: cached KV, same as CustomVoice speed
-                gen = generate_clone_cached_codec(text, clone_id, language)
+            elif clone_id and clone_id in engine._clone_prefill:
+                gen = engine.generate_clone_cached_codec(
+                    text, clone_id, language
+                )
                 codec_mode = True
-            elif clone_id and clone_id in _clone_cache:
-                # Ref audio known but prefill not cached yet — build it
-                _build_clone_prefill(clone_id, _clone_cache[clone_id], ref_text, language)
-                gen = generate_clone_cached_codec(text, clone_id, language)
+            elif clone_id and clone_id in engine._clone_cache:
+                engine.build_clone_prefill(
+                    clone_id,
+                    engine._clone_cache[clone_id],
+                    ref_text,
+                    language,
+                )
+                gen = engine.generate_clone_cached_codec(
+                    text, clone_id, language
+                )
                 codec_mode = True
             else:
                 try:
-                    await ws.send_text(json.dumps({"error": "clone_id not found"}))
+                    await ws.send_text(
+                        json.dumps({"error": "clone_id not found"})
+                    )
                 except (WebSocketDisconnect, Exception):
                     break
                 continue
-        elif codec_mode and USE_CACHE:
-            gen = generate_cached_codec(text, voice, language, instruct, cs)
-        elif USE_CACHE:
-            gen = generate_cached_streaming(text, voice, language, instruct, cs)
+        elif codec_mode and engine.USE_CACHE:
+            gen = engine.generate_cached_codec(
+                text, voice, language, instruct, cs
+            )
+        elif engine.USE_CACHE:
+            gen = engine.generate_cached_streaming(
+                text, voice, language, instruct, cs
+            )
         else:
-            gen = model.generate_custom_voice_streaming(
-                text=text, language=language, speaker=voice,
-                instruct=instruct or "", chunk_size=cs)
+            gen = engine.model.generate_custom_voice_streaming(
+                text=text,
+                language=language,
+                speaker=voice,
+                instruct=instruct or "",
+                chunk_size=cs,
+            )
 
         try:
-            _generation_active[0] = True
-            _last_frame_time[0] = time.monotonic()
-            req_deadline = time.monotonic() + _GENERATION_TIMEOUT
+            monitor.generation_active[0] = True
+            monitor.last_frame_time[0] = time.monotonic()
+            req_deadline = time.monotonic() + monitor.GENERATION_TIMEOUT
             loop = asyncio.get_event_loop()
             gen_iter = iter(gen)
 
@@ -1104,102 +220,150 @@ async def websocket_tts(ws: WebSocket):
             # stuck thread is abandoned (watchdog couche 2 handles cleanup).
             while True:
                 if time.monotonic() > req_deadline:
-                    raise RuntimeError(f"Request timeout ({_GENERATION_TIMEOUT}s)")
+                    raise RuntimeError(
+                        f"Request timeout ({monitor.GENERATION_TIMEOUT}s)"
+                    )
 
                 try:
                     item = await asyncio.wait_for(
-                        loop.run_in_executor(_gen_pool, _safe_next, gen_iter),
-                        timeout=_FRAME_TIMEOUT,
+                        loop.run_in_executor(
+                            _gen_pool, _safe_next, gen_iter
+                        ),
+                        timeout=monitor.FRAME_TIMEOUT,
                     )
                 except asyncio.TimeoutError:
-                    _mk_runtime_failures += 1
-                    if mk_predictor is not None and _mk_runtime_failures >= _MK_FAILURE_THRESHOLD:
-                        _auto_disable_megakernel()
+                    monitor.mk_failure_count += 1
+                    if (
+                        engine.mk_predictor is not None
+                        and monitor.mk_failure_count
+                        >= monitor.MK_FAILURE_THRESHOLD
+                    ):
+                        monitor._auto_disable_megakernel()
                     raise RuntimeError(
-                        f"Frame timeout ({_FRAME_TIMEOUT}s), probable deadlock "
-                        f"(mk_failures: {_mk_runtime_failures})"
+                        f"Frame timeout ({monitor.FRAME_TIMEOUT}s), probable deadlock "
+                        f"(mk_failures: {monitor.mk_failure_count})"
                     )
 
                 if item is _GEN_SENTINEL:
                     break  # Generator exhausted
 
-                _last_frame_time[0] = time.monotonic()
+                monitor.last_frame_time[0] = time.monotonic()
                 chunk_count += 1
 
                 if codec_mode:
-                    raw_bytes = item.cpu().numpy().astype(np.int16).tobytes()
+                    raw_bytes = (
+                        item.cpu().numpy().astype(np.int16).tobytes()
+                    )
                     if chunk_count == 1:
                         ttfp_ms = (time.perf_counter() - t0_req) * 1000
-                        header = json.dumps({"ttfp_ms": round(ttfp_ms, 1), "codec": True}).encode()
-                        await ws.send_bytes(struct.pack("<I", len(header)) + header + raw_bytes)
+                        header = json.dumps(
+                            {"ttfp_ms": round(ttfp_ms, 1), "codec": True}
+                        ).encode()
+                        await ws.send_bytes(
+                            struct.pack("<I", len(header)) + header + raw_bytes
+                        )
                     else:
                         await ws.send_bytes(raw_bytes)
                 else:
-                    audio_chunk = item[0] if isinstance(item, tuple) else item
-                    if isinstance(item, tuple) and len(item) > 1 and isinstance(item[1], int):
+                    audio_chunk = (
+                        item[0] if isinstance(item, tuple) else item
+                    )
+                    if (
+                        isinstance(item, tuple)
+                        and len(item) > 1
+                        and isinstance(item[1], int)
+                    ):
                         sr = item[1]
-                    pcm = (np.array(audio_chunk) * 32767).astype(np.int16).tobytes()
+                    pcm = (
+                        (np.array(audio_chunk) * 32767)
+                        .astype(np.int16)
+                        .tobytes()
+                    )
                     if chunk_count == 1:
                         ttfp_ms = (time.perf_counter() - t0_req) * 1000
-                        header = json.dumps({"ttfp_ms": round(ttfp_ms, 1), "sr": sr}).encode()
-                        await ws.send_bytes(struct.pack("<I", len(header)) + header + pcm)
+                        header = json.dumps(
+                            {"ttfp_ms": round(ttfp_ms, 1), "sr": sr}
+                        ).encode()
+                        await ws.send_bytes(
+                            struct.pack("<I", len(header)) + header + pcm
+                        )
                     else:
                         await ws.send_bytes(pcm)
 
                 if chunk_count % 10 == 0:
                     await asyncio.sleep(0)
 
-            _generation_active[0] = False
+            monitor.generation_active[0] = False
             total_ms = (time.perf_counter() - t0_req) * 1000
-            # Track TTFP for percentile monitoring
-            if ttfp_ms > 0:
-                _ttfp_history.append(ttfp_ms)
-                if len(_ttfp_history) > _TTFP_HISTORY_MAX:
-                    _ttfp_history.pop(0)
-            await ws.send_text(json.dumps({
-                "done": True, "ttfp_ms": round(ttfp_ms, 1),
-                "total_ms": round(total_ms, 1), "chunks": chunk_count,
-            }))
+            monitor.record_ttfp(ttfp_ms)
+            await ws.send_text(
+                json.dumps(
+                    {
+                        "done": True,
+                        "ttfp_ms": round(ttfp_ms, 1),
+                        "total_ms": round(total_ms, 1),
+                        "chunks": chunk_count,
+                    }
+                )
+            )
 
         except (WebSocketDisconnect, ConnectionError):
             disconnected = True
-            _generation_active[0] = False
+            monitor.generation_active[0] = False
         except RuntimeError as rte:
-            # Timeout or deadlock — log, notify client, stay alive
-            _generation_active[0] = False
-            _total_errors += 1
+            monitor.generation_active[0] = False
+            monitor.error_count += 1
             print(f"RUNTIME ERROR: {rte}")
             try:
-                await ws.send_text(json.dumps({"error": str(rte)[:200], "done": True}))
+                await ws.send_text(
+                    json.dumps({"error": str(rte)[:200], "done": True})
+                )
             except (WebSocketDisconnect, Exception):
                 disconnected = True
         except Exception as exc:
-            _generation_active[0] = False
-            _total_errors += 1
+            monitor.generation_active[0] = False
+            monitor.error_count += 1
             import traceback
+
             err_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
             traceback.print_exc()
             try:
-                await ws.send_text(json.dumps({"error": err_msg, "done": True}))
+                await ws.send_text(
+                    json.dumps({"error": err_msg, "done": True})
+                )
             except (WebSocketDisconnect, Exception):
                 disconnected = True
 
         # Periodic GC to prevent memory creep
-        if _request_count % _gc_interval == 0:
+        if monitor.request_count % _gc_interval == 0:
             gc.collect()
             torch.cuda.empty_cache()
 
 
 @app.get("/generate")
-async def generate_wav(text: str, voice: str = "Vivian", language: str = "French", instruct: str = ""):
+async def generate_wav(
+    text: str,
+    voice: str = "Vivian",
+    language: str = "French",
+    instruct: str = "",
+):
     """Generate a WAV file from text. Used for sample generation."""
     import io
     import soundfile as sf
     from fastapi.responses import Response
+
     audio_chunks = []
-    for chunk_data in generate_cached_streaming(text, voice, language, instruct, chunk_size=1):
-        audio_chunks.append(chunk_data[0] if isinstance(chunk_data, tuple) else chunk_data)
-        sr = chunk_data[1] if isinstance(chunk_data, tuple) and len(chunk_data) > 1 else 24000
+    for chunk_data in engine.generate_cached_streaming(
+        text, voice, language, instruct, chunk_size=1
+    ):
+        audio_chunks.append(
+            chunk_data[0] if isinstance(chunk_data, tuple) else chunk_data
+        )
+        sr = (
+            chunk_data[1]
+            if isinstance(chunk_data, tuple) and len(chunk_data) > 1
+            else 24000
+        )
     audio = np.concatenate(audio_chunks)
     buf = io.BytesIO()
     sf.write(buf, audio, sr, format="WAV", subtype="PCM_16")
@@ -1207,76 +371,60 @@ async def generate_wav(text: str, voice: str = "Vivian", language: str = "French
     return Response(content=buf.read(), media_type="audio/wav")
 
 
-def _health_status():
-    """Compute health status: ok / degraded / unhealthy."""
-    if _generation_active[0] and (time.monotonic() - _last_frame_time[0]) > _FRAME_TIMEOUT:
-        return "unhealthy"  # Likely deadlocked right now
-    if _server_degraded or _mk_runtime_failures >= _MK_FAILURE_THRESHOLD:
-        return "degraded"   # Megakernel was auto-disabled
-    return "ok"
-
-
-def _ttfp_percentiles():
-    """Compute TTFP percentiles from recent history."""
-    if not _ttfp_history:
-        return {}
-    s = sorted(_ttfp_history)
-    n = len(s)
-    return {
-        "p50": round(s[n // 2], 1),
-        "p90": round(s[int(n * 0.9)], 1),
-        "p99": round(s[min(int(n * 0.99), n - 1)], 1),
-        "min": round(s[0], 1),
-        "max": round(s[-1], 1),
-        "samples": n,
-    }
-
-
 @app.get("/health")
 def health():
     return {
-        "status": _health_status(),
+        "status": monitor.health_status(),
         "gpu": torch.cuda.get_device_name(0),
-        "model": MODEL_SIZE,
-        "combos": len(prefill_cache) if USE_CACHE else 0,
-        "ttfp_ms": round(cached_ttfp_ms, 1),
-        "megakernel_predictor": mk_predictor is not None,
-        "megakernel_talker": mk_talker is not None,
-        "requests": _request_count,
-        "errors": _total_errors,
-        "mk_failures": _mk_runtime_failures,
+        "model": engine.MODEL_SIZE,
+        "combos": len(engine.prefill_cache) if engine.USE_CACHE else 0,
+        "ttfp_ms": round(engine.cached_ttfp_ms, 1),
+        "megakernel_predictor": engine.mk_predictor is not None,
+        "megakernel_talker": engine.mk_talker is not None,
+        "requests": monitor.request_count,
+        "errors": monitor.error_count,
+        "mk_failures": monitor.mk_failure_count,
     }
 
 
 @app.get("/health/detail")
 def health_detail():
     return {
-        "status": _health_status(),
+        "status": monitor.health_status(),
         "gpu": torch.cuda.get_device_name(0),
-        "gpu_arch": f"sm_{_gpu_arch}",
+        "gpu_arch": f"sm_{engine.gpu_arch}",
         "gpu_mem_mb": round(torch.cuda.memory_allocated() / 1024 / 1024),
-        "gpu_mem_peak_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024),
-        "combos": len(prefill_cache) if USE_CACHE else 0,
-        "ttfp_ms": round(cached_ttfp_ms, 1),
-        "ttfp_live": _ttfp_percentiles(),
-        "requests": _request_count,
-        "errors": _total_errors,
-        "mk_failures": _mk_runtime_failures,
-        "degraded": _server_degraded,
-        "generation_active": _generation_active[0],
+        "gpu_mem_peak_mb": round(
+            torch.cuda.max_memory_allocated() / 1024 / 1024
+        ),
+        "combos": len(engine.prefill_cache) if engine.USE_CACHE else 0,
+        "ttfp_ms": round(engine.cached_ttfp_ms, 1),
+        "ttfp_live": monitor.ttfp_percentiles(),
+        "requests": monitor.request_count,
+        "errors": monitor.error_count,
+        "mk_failures": monitor.mk_failure_count,
+        "degraded": monitor.server_degraded,
+        "generation_active": monitor.generation_active[0],
     }
 
 
 if __name__ == "__main__":
     try:
         import uvloop
+
         uvloop.install()
     except ImportError:
         pass
     import uvicorn
+
     ssl_cert = os.environ.get("SSL_CERT")
     ssl_key = os.environ.get("SSL_KEY")
     uvicorn.run(
-        app, host="0.0.0.0", port=8000, ws="websockets", log_level="warning",
-        ssl_certfile=ssl_cert, ssl_keyfile=ssl_key,
+        app,
+        host="0.0.0.0",
+        port=8000,
+        ws="websockets",
+        log_level="warning",
+        ssl_certfile=ssl_cert,
+        ssl_keyfile=ssl_key,
     )
