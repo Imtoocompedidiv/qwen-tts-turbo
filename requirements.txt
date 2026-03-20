@@ -1,1 +1,5 @@
 websockets>=13.0
+faster-qwen3-tts
+qwen-tts
+soundfile
+ninja

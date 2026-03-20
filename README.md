@@ -155,12 +155,12 @@ Subsequent requests reuse the cached clone with just `"clone_id": "my-voice"`.
 
 ## Requirements
 
-**Client**: Python 3.10+, `websockets`
+**Client**: Python 3.10+, `websockets>=13.0`
 
 **Server** (auto-installed on RunPod):
 - Docker image: `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`
-- `faster-qwen3-tts`, `qwen-tts`, `soundfile`, `ninja`
-- GPU: B200 (recommended), H200, H100, A100, RTX 5090/4090 (16GB+ VRAM)
+- `faster-qwen3-tts`, `qwen-tts`, `soundfile`, `ninja`, `websockets`
+- GPU: B200, H200, H100 (sm_90+, megakernel enabled), A100 (sm_80, CUDA graph fallback), L40S (16GB+ VRAM)
 
 ## License
 

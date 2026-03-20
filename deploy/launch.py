@@ -23,7 +23,12 @@ API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID", "")
 VOLUMES = {os.environ.get("RUNPOD_DC", "EU-NL-1"): VOLUME_ID} if VOLUME_ID else {}
 IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
-GPU_CHAIN = ["NVIDIA B200", "NVIDIA H200", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe", "NVIDIA L40S"]
+GPU_CHAIN = [
+    "NVIDIA B200", "NVIDIA H200",
+    "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe",
+    "NVIDIA A100-SXM4-80GB", "NVIDIA A100 80GB PCIe",
+    "NVIDIA L40S",
+]
 SSH_KEY = os.environ.get("RUNPOD_SSH_KEY", "")
 
 
@@ -165,7 +170,7 @@ def wait_ready(pod_id):
                     print(f"  HTTP:      http://{tcp}/v1/audio/speech")
                     print(f"  Health:    http://{tcp}/health")
                     return tcp
-            except:
+            except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
                 pass
 
         if i % 6 == 0 and i > 0:
@@ -212,7 +217,7 @@ def status():
                 h = json.loads(r.stdout)
                 print(f"Status: READY ({h.get('combos')} combos, {h.get('ttfp_ms')}ms)")
                 print(f"WS: ws://{tcp}/ws/tts")
-        except:
+        except (subprocess.TimeoutExpired, json.JSONDecodeError, Exception):
             print("Status: starting...")
 
 

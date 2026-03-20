@@ -1,11 +1,13 @@
 """Qwen3-TTS server — production hardened, minimum TTFP."""
 
 import gc
+import hmac
 import json
 import os
 import struct
 import time
 import threading
+from collections import OrderedDict
 
 import numpy as np
 import torch
@@ -444,22 +446,27 @@ if USE_CACHE:
     print(f"  {len(prefill_cache)} combos cached, {kv_bytes/1024/1024:.1f}MB each, {kv_bytes*len(prefill_cache)/1024/1024:.0f}MB total")
 
 
-_tth_cache = {}  # text → tth tensor (LRU-style, max 200 entries)
+_tth_cache = OrderedDict()  # text → tth tensor, true LRU, max 200 entries
+_TTH_CACHE_MAX = 200
 
 @torch.inference_mode()
 def _compute_tth(text):
-    """Compute trailing_text_hiddens with tokenization cache."""
+    """Compute trailing_text_hiddens with LRU cache."""
     cached = _tth_cache.get(text)
     if cached is not None:
+        _tth_cache.move_to_end(text)
         return cached
     input_texts = [model.model._build_assistant_text(text)]
     input_ids = model.model._tokenize_texts(input_texts)[0]
-    text_tokens = input_ids[:, 4:-5]
+    if input_ids.shape[1] < 9:
+        text_tokens = input_ids
+    else:
+        text_tokens = input_ids[:, 4:-5]
     tth = cached_talker.text_projection(
         cached_talker.get_text_embeddings()(text_tokens))
     result = torch.cat((tth, cached_tts_eos_embed), dim=1)
-    if len(_tth_cache) >= 200:
-        _tth_cache.pop(next(iter(_tth_cache)))
+    if len(_tth_cache) >= _TTH_CACHE_MAX:
+        _tth_cache.popitem(last=False)
     _tth_cache[text] = result
     return result
 
@@ -779,23 +786,27 @@ def _build_clone_prefill(clone_id, ref_audio, ref_text, language="French"):
     return _clone_prefill[clone_id]
 
 
-_clone_tth_cache = {}
+_clone_tth_cache = OrderedDict()
 
 @torch.inference_mode()
 def _compute_clone_tth(text):
     """Compute trailing_text_hiddens using the Base model's text encoder."""
     cached = _clone_tth_cache.get(text)
     if cached is not None:
+        _clone_tth_cache.move_to_end(text)
         return cached
     cm = _get_clone_model()
     input_texts = [cm.model._build_assistant_text(text)]
     input_ids = cm.model._tokenize_texts(input_texts)[0]
-    text_tokens = input_ids[:, 4:-5]
+    if input_ids.shape[1] < 9:
+        text_tokens = input_ids
+    else:
+        text_tokens = input_ids[:, 4:-5]
     tth = _clone_refs["talker"].text_projection(
         _clone_refs["talker"].get_text_embeddings()(text_tokens))
     result = torch.cat((tth, _clone_refs["tts_eos_embed"]), dim=1)
-    if len(_clone_tth_cache) >= 200:
-        _clone_tth_cache.pop(next(iter(_clone_tth_cache)))
+    if len(_clone_tth_cache) >= _TTH_CACHE_MAX:
+        _clone_tth_cache.popitem(last=False)
     _clone_tth_cache[text] = result
     return result
 
@@ -898,12 +909,12 @@ async def websocket_tts(ws: WebSocket):
         try:
             raw = await ws.receive_text()
             msg = json.loads(raw)
-            if msg.get("auth") != API_KEY:
+            if not hmac.compare_digest(msg.get("auth", ""), API_KEY):
                 await ws.send_text(json.dumps({"error": "unauthorized"}))
                 await ws.close()
                 return
             await ws.send_text(json.dumps({"auth": "ok"}))
-        except:
+        except (WebSocketDisconnect, Exception):
             return
 
     while not disconnected:
@@ -916,10 +927,10 @@ async def websocket_tts(ws: WebSocket):
 
         try:
             req = json.loads(raw)
-        except (json.JSONDecodeError, Exception):
+        except (json.JSONDecodeError, ValueError):
             try:
                 await ws.send_text(json.dumps({"error": "invalid json"}))
-            except:
+            except (WebSocketDisconnect, Exception):
                 break
             continue
 
@@ -927,7 +938,7 @@ async def websocket_tts(ws: WebSocket):
         voice = req.get("voice", "Vivian")
         language = req.get("language", "French")
         instruct = req.get("instruct", "")
-        cs = req.get("chunk_size", CHUNK_SIZE)
+        cs = max(1, min(16, int(req.get("chunk_size", CHUNK_SIZE))))
         codec_mode = req.get("codec", False)
 
         # Voice cloning params
@@ -935,10 +946,25 @@ async def websocket_tts(ws: WebSocket):
         ref_text = req.get("ref_text", "")
         clone_id = req.get("clone_id", "")  # reuse cached voice prompt
 
+        # Input validation
+        MAX_TEXT_LEN = 10000
+        MAX_AUDIO_B64 = 10 * 1024 * 1024  # 10MB
         if not text:
             try:
                 await ws.send_text(json.dumps({"error": "empty input"}))
-            except:
+            except (WebSocketDisconnect, Exception):
+                break
+            continue
+        if len(text) > MAX_TEXT_LEN:
+            try:
+                await ws.send_text(json.dumps({"error": f"text too long ({len(text)} > {MAX_TEXT_LEN})"}))
+            except (WebSocketDisconnect, Exception):
+                break
+            continue
+        if ref_audio_b64 and len(ref_audio_b64) > MAX_AUDIO_B64:
+            try:
+                await ws.send_text(json.dumps({"error": "ref_audio too large"}))
+            except (WebSocketDisconnect, Exception):
                 break
             continue
 
@@ -959,9 +985,15 @@ async def websocket_tts(ws: WebSocket):
             if ref_audio_b64:
                 # First call: save ref audio, build prefill cache
                 audio_bytes = base64.b64decode(ref_audio_b64)
-                ref_path = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
-                with open(ref_path, "wb") as f:
-                    f.write(audio_bytes)
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                ref_path = tmp.name
+                try:
+                    tmp.write(audio_bytes)
+                    tmp.close()
+                except Exception:
+                    tmp.close()
+                    os.unlink(ref_path)
+                    raise
                 cid = clone_id or f"_auto_{_request_count}"
                 _clone_cache[cid] = ref_path
                 _build_clone_prefill(cid, ref_path, ref_text, language)
@@ -983,7 +1015,7 @@ async def websocket_tts(ws: WebSocket):
             else:
                 try:
                     await ws.send_text(json.dumps({"error": "clone_id not found"}))
-                except:
+                except (WebSocketDisconnect, Exception):
                     break
                 continue
         elif codec_mode and USE_CACHE:
@@ -1036,11 +1068,11 @@ async def websocket_tts(ws: WebSocket):
         except Exception as exc:
             # Unknown error during generation — notify client with details
             import traceback
-            err_msg = f"{type(exc).__name__}: {exc}"
+            err_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
             traceback.print_exc()
             try:
                 await ws.send_text(json.dumps({"error": err_msg, "done": True}))
-            except:
+            except (WebSocketDisconnect, Exception):
                 disconnected = True
 
         # Periodic GC to prevent memory creep
