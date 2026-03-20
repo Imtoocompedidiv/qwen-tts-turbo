@@ -712,6 +712,28 @@ API_KEY = os.environ.get("TTS_API_KEY", "")
 _request_count = 0
 _gc_interval = 100
 
+# ── Runtime monitoring & auto-fallback ────────────────────────────────
+_GENERATION_TIMEOUT = float(os.environ.get("GENERATION_TIMEOUT", "60"))
+_FRAME_TIMEOUT = float(os.environ.get("FRAME_TIMEOUT", "10"))
+_MK_FAILURE_THRESHOLD = 3
+
+_mk_runtime_failures = 0
+_server_degraded = False
+_total_errors = 0
+_ttfp_history = []  # last 100 TTFP values for percentile tracking
+_TTFP_HISTORY_MAX = 100
+_last_frame_time = [time.monotonic()]
+_generation_active = [False]
+
+
+def _auto_disable_megakernel():
+    """Disable predictor megakernel at runtime after repeated failures."""
+    global mk_predictor, _server_degraded
+    if mk_predictor is not None:
+        print(f"AUTO-FALLBACK: Disabling megakernel predictor after {_MK_FAILURE_THRESHOLD} runtime failures")
+        mk_predictor = None
+        _server_degraded = True
+
 # ── Voice clone: lazy-loaded Base model + prefix KV cache per voice ───
 _clone_model = None
 _clone_cache = {}          # clone_id → ref_audio path
@@ -1028,13 +1050,29 @@ async def websocket_tts(ws: WebSocket):
                 instruct=instruct or "", chunk_size=cs)
 
         try:
+            _generation_active[0] = True
+            _last_frame_time[0] = time.monotonic()
+            req_deadline = time.monotonic() + _GENERATION_TIMEOUT
+
             for item in gen:
+                frame_elapsed = time.monotonic() - _last_frame_time[0]
+                if frame_elapsed > _FRAME_TIMEOUT:
+                    _mk_runtime_failures += 1
+                    if mk_predictor is not None and _mk_runtime_failures >= _MK_FAILURE_THRESHOLD:
+                        _auto_disable_megakernel()
+                    raise RuntimeError(
+                        f"Frame timeout ({frame_elapsed:.1f}s > {_FRAME_TIMEOUT}s), "
+                        f"possible megakernel deadlock (failures: {_mk_runtime_failures})"
+                    )
+                if time.monotonic() > req_deadline:
+                    raise RuntimeError(
+                        f"Request timeout ({_GENERATION_TIMEOUT}s)"
+                    )
+                _last_frame_time[0] = time.monotonic()
                 chunk_count += 1
 
                 if codec_mode:
                     raw_bytes = item.cpu().numpy().astype(np.int16).tobytes()
-                    # Measure TTFP AFTER .cpu() — this forces GPU sync,
-                    # giving the REAL time (not just CPU queue time)
                     if chunk_count == 1:
                         ttfp_ms = (time.perf_counter() - t0_req) * 1000
                         header = json.dumps({"ttfp_ms": round(ttfp_ms, 1), "codec": True}).encode()
@@ -1056,17 +1094,33 @@ async def websocket_tts(ws: WebSocket):
                 if chunk_count % 10 == 0:
                     await asyncio.sleep(0)
 
+            _generation_active[0] = False
             total_ms = (time.perf_counter() - t0_req) * 1000
+            # Track TTFP for percentile monitoring
+            if ttfp_ms > 0:
+                _ttfp_history.append(ttfp_ms)
+                if len(_ttfp_history) > _TTFP_HISTORY_MAX:
+                    _ttfp_history.pop(0)
             await ws.send_text(json.dumps({
                 "done": True, "ttfp_ms": round(ttfp_ms, 1),
                 "total_ms": round(total_ms, 1), "chunks": chunk_count,
             }))
 
-        except (WebSocketDisconnect, ConnectionError, RuntimeError):
-            # Client disconnected during generation — stop cleanly
+        except (WebSocketDisconnect, ConnectionError):
             disconnected = True
+            _generation_active[0] = False
+        except RuntimeError as rte:
+            # Timeout or deadlock — log, notify client, stay alive
+            _generation_active[0] = False
+            _total_errors += 1
+            print(f"RUNTIME ERROR: {rte}")
+            try:
+                await ws.send_text(json.dumps({"error": str(rte)[:200], "done": True}))
+            except (WebSocketDisconnect, Exception):
+                disconnected = True
         except Exception as exc:
-            # Unknown error during generation — notify client with details
+            _generation_active[0] = False
+            _total_errors += 1
             import traceback
             err_msg = f"{type(exc).__name__}: {str(exc)[:200]}"
             traceback.print_exc()
@@ -1098,10 +1152,35 @@ async def generate_wav(text: str, voice: str = "Vivian", language: str = "French
     return Response(content=buf.read(), media_type="audio/wav")
 
 
+def _health_status():
+    """Compute health status: ok / degraded / unhealthy."""
+    if _generation_active[0] and (time.monotonic() - _last_frame_time[0]) > _FRAME_TIMEOUT:
+        return "unhealthy"  # Likely deadlocked right now
+    if _server_degraded or _mk_runtime_failures >= _MK_FAILURE_THRESHOLD:
+        return "degraded"   # Megakernel was auto-disabled
+    return "ok"
+
+
+def _ttfp_percentiles():
+    """Compute TTFP percentiles from recent history."""
+    if not _ttfp_history:
+        return {}
+    s = sorted(_ttfp_history)
+    n = len(s)
+    return {
+        "p50": round(s[n // 2], 1),
+        "p90": round(s[int(n * 0.9)], 1),
+        "p99": round(s[min(int(n * 0.99), n - 1)], 1),
+        "min": round(s[0], 1),
+        "max": round(s[-1], 1),
+        "samples": n,
+    }
+
+
 @app.get("/health")
 def health():
     return {
-        "status": "ok",
+        "status": _health_status(),
         "gpu": torch.cuda.get_device_name(0),
         "model": MODEL_SIZE,
         "combos": len(prefill_cache) if USE_CACHE else 0,
@@ -1109,19 +1188,27 @@ def health():
         "megakernel_predictor": mk_predictor is not None,
         "megakernel_talker": mk_talker is not None,
         "requests": _request_count,
+        "errors": _total_errors,
+        "mk_failures": _mk_runtime_failures,
     }
 
 
 @app.get("/health/detail")
 def health_detail():
     return {
-        "status": "ok",
+        "status": _health_status(),
         "gpu": torch.cuda.get_device_name(0),
+        "gpu_arch": f"sm_{_gpu_arch}",
         "gpu_mem_mb": round(torch.cuda.memory_allocated() / 1024 / 1024),
         "gpu_mem_peak_mb": round(torch.cuda.max_memory_allocated() / 1024 / 1024),
         "combos": len(prefill_cache) if USE_CACHE else 0,
         "ttfp_ms": round(cached_ttfp_ms, 1),
+        "ttfp_live": _ttfp_percentiles(),
         "requests": _request_count,
+        "errors": _total_errors,
+        "mk_failures": _mk_runtime_failures,
+        "degraded": _server_degraded,
+        "generation_active": _generation_active[0],
     }
 
 
