@@ -6,7 +6,7 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 | GPU | Path | TTFP codec raw | TTFP PCM | Stability |
 |-----|------|---------------|----------|-----------|
-| **RTX 5090** | MK predictor + CUDA graph talker | **3.5ms** startup / **4.6ms** p50 | **28ms** | **500/500 requests, 0 errors**, 0 reconnects, 0MB memory drift |
+| **RTX 5090** | MK predictor + CUDA graph talker | **3.3ms** startup / **4ms** p50 | **17ms** | **500/500 requests, 0 errors**, 0 reconnects, 0MB memory drift |
 | **H100 SXM** | MK predictor + CUDA graph talker | **4ms** | **16ms** | All texts 1w→45w, all tones, 0 crashes |
 | **A100 SXM** | CUDA graph only | **16ms** | **24ms** | Fully stable, 250+ requests verified |
 
