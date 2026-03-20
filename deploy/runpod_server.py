@@ -706,6 +706,7 @@ threading.Thread(target=_predownload_base, daemon=True).start()
 
 import asyncio
 import base64
+import concurrent.futures
 import tempfile
 
 API_KEY = os.environ.get("TTS_API_KEY", "")
@@ -725,14 +726,54 @@ _TTFP_HISTORY_MAX = 100
 _last_frame_time = [time.monotonic()]
 _generation_active = [False]
 
+# Thread pool for async generation (run_in_executor)
+_gen_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="gen")
+_GEN_SENTINEL = object()  # signals StopIteration across executor boundary
+
+
+def _safe_next(gen_iter):
+    """next() wrapper that returns _GEN_SENTINEL instead of raising StopIteration.
+
+    StopIteration doesn't propagate cleanly through run_in_executor,
+    so we convert it to a sentinel value.
+    """
+    try:
+        return next(gen_iter)
+    except StopIteration:
+        return _GEN_SENTINEL
+
 
 def _auto_disable_megakernel():
     """Disable predictor megakernel at runtime after repeated failures."""
     global mk_predictor, _server_degraded
     if mk_predictor is not None:
-        print(f"AUTO-FALLBACK: Disabling megakernel predictor after {_MK_FAILURE_THRESHOLD} runtime failures")
+        print(f"AUTO-FALLBACK: Disabling megakernel predictor after {_MK_FAILURE_THRESHOLD} runtime failures",
+              flush=True)
         mk_predictor = None
         _server_degraded = True
+
+
+# ── Couche 2: in-process watchdog — force exit on stuck generation ────
+def _deadlock_watchdog():
+    """Background thread: force-exit if generation is stuck beyond timeout.
+
+    This catches cases where the async timeout (couche 1) is bypassed,
+    e.g. if the event loop itself is blocked or the executor thread
+    holds the GIL during a CUDA deadlock.
+    """
+    GRACE = 5  # extra seconds beyond FRAME_TIMEOUT before hard kill
+    while True:
+        time.sleep(2)
+        if _generation_active[0]:
+            elapsed = time.monotonic() - _last_frame_time[0]
+            if elapsed > _FRAME_TIMEOUT + GRACE:
+                print(f"WATCHDOG: Generation stuck {elapsed:.0f}s "
+                      f"(limit {_FRAME_TIMEOUT + GRACE:.0f}s). Force exit.",
+                      flush=True)
+                os._exit(1)  # Hard exit — start.sh restart loop picks up
+
+
+threading.Thread(target=_deadlock_watchdog, daemon=True, name="deadlock-watchdog").start()
 
 # ── Voice clone: lazy-loaded Base model + prefix KV cache per voice ───
 _clone_model = None
@@ -1053,21 +1094,35 @@ async def websocket_tts(ws: WebSocket):
             _generation_active[0] = True
             _last_frame_time[0] = time.monotonic()
             req_deadline = time.monotonic() + _GENERATION_TIMEOUT
+            loop = asyncio.get_event_loop()
+            gen_iter = iter(gen)
 
-            for item in gen:
-                frame_elapsed = time.monotonic() - _last_frame_time[0]
-                if frame_elapsed > _FRAME_TIMEOUT:
+            # Couche 1: async frame loop with hard timeout on next(gen).
+            # run_in_executor moves the blocking next() call to a thread.
+            # wait_for enforces the deadline BEFORE Python blocks.
+            # If CUDA deadlocks, wait_for raises TimeoutError while the
+            # stuck thread is abandoned (watchdog couche 2 handles cleanup).
+            while True:
+                if time.monotonic() > req_deadline:
+                    raise RuntimeError(f"Request timeout ({_GENERATION_TIMEOUT}s)")
+
+                try:
+                    item = await asyncio.wait_for(
+                        loop.run_in_executor(_gen_pool, _safe_next, gen_iter),
+                        timeout=_FRAME_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
                     _mk_runtime_failures += 1
                     if mk_predictor is not None and _mk_runtime_failures >= _MK_FAILURE_THRESHOLD:
                         _auto_disable_megakernel()
                     raise RuntimeError(
-                        f"Frame timeout ({frame_elapsed:.1f}s > {_FRAME_TIMEOUT}s), "
-                        f"possible megakernel deadlock (failures: {_mk_runtime_failures})"
+                        f"Frame timeout ({_FRAME_TIMEOUT}s), probable deadlock "
+                        f"(mk_failures: {_mk_runtime_failures})"
                     )
-                if time.monotonic() > req_deadline:
-                    raise RuntimeError(
-                        f"Request timeout ({_GENERATION_TIMEOUT}s)"
-                    )
+
+                if item is _GEN_SENTINEL:
+                    break  # Generator exhausted
+
                 _last_frame_time[0] = time.monotonic()
                 chunk_count += 1
 
