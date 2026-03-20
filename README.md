@@ -58,7 +58,7 @@ export $(cat .env | xargs)
 python deploy/launch.py
 ```
 
-Creates a GPU pod, installs dependencies, downloads model, clones + patches megakernel, builds 480 KV caches, starts server. ~30s on H100.
+Creates a GPU pod that auto-clones this repo, installs dependencies, downloads the model, clones + patches the megakernel, builds 480 KV caches, and starts the server. Fully self-contained — no manual file setup needed. ~30s on H100.
 
 ### 3. Benchmark
 

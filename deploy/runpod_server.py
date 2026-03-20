@@ -165,7 +165,7 @@ if USE_TALKER_MK:
         t_tmk = time.time()
 
         # Build talker kernel (HIDDEN=2048, INTERMEDIATE=6144, NUM_KV_HEADS=8)
-        _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "industrial"))
         from build_talker_megakernel import get_talker_extension
         print("Building talker megakernel...")
         get_talker_extension("/workspace/megakernel-tts")

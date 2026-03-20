@@ -72,20 +72,30 @@ def create_pod():
     balance = graphql('{ myself { clientBalance } }')["data"]["myself"]["clientBalance"]
     print(f"Balance: ${balance:.2f}")
 
+    REPO_URL = "https://github.com/Imtoocompedidiv/qwen-tts-turbo.git"
+    # Self-contained startup: clone repo then run start.sh
+    STARTUP_CMD = (
+        f"git clone --depth 1 {REPO_URL} /workspace/qwen-tts-turbo && "
+        f"bash /workspace/qwen-tts-turbo/deploy/start.sh"
+    )
+
     def try_create(dc, vol_id):
         for gpu in GPU_CHAIN:
-            result = api("POST", "pods", {
+            pod_config = {
                 "name": "qwen3-tts",
                 "imageName": IMAGE,
                 "gpuTypeIds": [gpu],
-                "dataCenterIds": [dc],
-                "containerDiskInGb": 20,
-                "networkVolumeId": vol_id,
+                "containerDiskInGb": 50,
                 "ports": ["8000/tcp", "22/tcp"],
                 "volumeMountPath": "/workspace",
-                "dockerStartCmd": "bash /workspace/start.sh",
+                "dockerStartCmd": STARTUP_CMD,
                 "env": {"PUBLIC_KEY": SSH_KEY},
-            })
+            }
+            if vol_id:
+                pod_config["networkVolumeId"] = vol_id
+            if dc:
+                pod_config["dataCenterIds"] = [dc]
+            result = api("POST", "pods", pod_config)
             if "id" in result:
                 gpu_name = result.get("machine", {}).get("gpuTypeId", gpu)
                 cost = result.get("costPerHr", "?")
@@ -93,16 +103,23 @@ def create_pod():
                 return result["id"]
         return None
 
-    # Try each DC with a provisioned volume
-    for dc, vol_id in VOLUMES.items():
-        print(f"Trying {dc}...")
-        pod_id = try_create(dc, vol_id)
+    # Try each DC (with or without volume)
+    if VOLUMES:
+        for dc, vol_id in VOLUMES.items():
+            print(f"Trying {dc}...")
+            pod_id = try_create(dc, vol_id)
+            if pod_id:
+                return pod_id
+            print(f"  No GPU in {dc}")
+    else:
+        # No volume configured — deploy without volume (fully self-contained)
+        print("No volume configured. Deploying self-contained pod...")
+        pod_id = try_create("", None)
         if pod_id:
             return pod_id
-        print(f"  No GPU in {dc}")
 
     # Retry loop
-    print("All DCs unavailable. Retrying every 30s...")
+    print("No GPU available. Retrying every 30s...")
     for attempt in range(20):
         time.sleep(30)
         for dc, vol_id in VOLUMES.items():
