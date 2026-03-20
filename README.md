@@ -6,6 +6,7 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 | GPU | Path | TTFP codec raw | TTFP PCM | Stability |
 |-----|------|---------------|----------|-----------|
+| **RTX 5090** | MK predictor + CUDA graph talker | **3.5ms** startup / **4.6ms** p50 | **28ms** | **500/500 requests, 0 errors**, 0 reconnects, 0MB memory drift |
 | **H100 SXM** | MK predictor + CUDA graph talker | **4ms** | **16ms** | All texts 1w→45w, all tones, 0 crashes |
 | **A100 SXM** | CUDA graph only | **16ms** | **24ms** | Fully stable, 250+ requests verified |
 
@@ -20,8 +21,8 @@ TTFP = time from request receipt to first codec frame ready on GPU (after `.cpu(
 | Tone presets | 8 (neutral, warm, soft, dynamic, calm, formal, joyful, authoritative) |
 | Pre-cached combos | **480** (voice x language x tone), zero-cost switching |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
-| Stability | All 5 text lengths (1w→45w), all 5 tones, 0 crashes on H100 SXM |
-| TTFP stability | Constant 1 word → 45 words (4ms ± 0ms codec raw). Text encoding deferred — architecturally not on critical path |
+| Stability | **500/500** requests on RTX 5090, 0 errors, 0 reconnects, 0MB GPU memory drift |
+| TTFP stability | Constant 1w→45w (4ms ± 0ms codec raw). Server CV=4.3%. Drift: +0.0ms over 500 requests |
 | Audio quality | Cosine similarity 0.9995 vs CUDA graph baseline (numerically identical) |
 
 ## How it works
