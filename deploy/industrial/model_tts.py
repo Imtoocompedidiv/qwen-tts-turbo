@@ -375,7 +375,7 @@ class TextProjection:
 
 
 class CodePredictor:
-    """Runs the code predictor (5-layer transformer) to generate codebook groups 1-14.
+    """Runs the code predictor (5-layer transformer) to generate codebook groups 1-15.
 
     Given the talker's hidden state and first codebook token, autoregressively
     generates the remaining NUM_CODE_GROUPS-1 codebook tokens.
@@ -388,7 +388,7 @@ class CodePredictor:
     def __init__(self, weights: dict, device: str = "cuda"):
         cp = weights["code_predictor"]
         self.device = device
-        self.num_groups = NUM_CODE_GROUPS - 1  # 14 groups to predict
+        self.num_groups = NUM_CODE_GROUPS - 1  # 15 groups to predict
         self._max_seq = 20  # max sequence length for KV cache
 
         # Per-group embedding and LM head

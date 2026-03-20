@@ -23,7 +23,7 @@ API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID", "")
 VOLUMES = {os.environ.get("RUNPOD_DC", "EU-NL-1"): VOLUME_ID} if VOLUME_ID else {}
 IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
-GPU_CHAIN = ["NVIDIA H100 80GB HBM3", "NVIDIA L40S", "NVIDIA B200", "NVIDIA H200", "NVIDIA H100 PCIe"]
+GPU_CHAIN = ["NVIDIA B200", "NVIDIA H200", "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe", "NVIDIA L40S"]
 SSH_KEY = os.environ.get("RUNPOD_SSH_KEY", "")
 
 
@@ -122,8 +122,13 @@ def create_pod():
     print("No GPU available. Retrying every 30s...")
     for attempt in range(20):
         time.sleep(30)
-        for dc, vol_id in VOLUMES.items():
-            pod_id = try_create(dc, vol_id)
+        if VOLUMES:
+            for dc, vol_id in VOLUMES.items():
+                pod_id = try_create(dc, vol_id)
+                if pod_id:
+                    return pod_id
+        else:
+            pod_id = try_create("", None)
             if pod_id:
                 return pod_id
         print(f"  Retry {attempt+1}/20...")

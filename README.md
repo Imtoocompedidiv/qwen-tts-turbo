@@ -6,10 +6,12 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 | GPU | TTFP (first audio frame) | Full step | Throughput | Realtime factor |
 |-----|-------------------------|-----------|------------|-----------------|
-| **RTX 5090** | **3.3ms** | **5.1ms/frame** | 196 fps | **16x realtime** |
 | **H100 SXM** | **4.0ms** | **6.3ms/frame** | 158 fps | **13x realtime** |
+| **RTX 5090** | **3.3ms** | **5.1ms/frame** | 196 fps | **16x realtime** |
 
 All times measured with CUDA events after `torch.cuda.synchronize()`. No CPU queue time tricks.
+
+> **Note:** RTX 5090 is a consumer card. For production deployments, use datacenter GPUs (B200, H200, H100) which offer ECC memory, higher reliability, and better availability on cloud providers.
 
 | Feature | Details |
 |---------|---------|
@@ -19,7 +21,7 @@ All times measured with CUDA events after `torch.cuda.synchronize()`. No CPU que
 | Pre-cached combos | **480** (voice x language x tone), zero-cost switching |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
 | Stability | 500/500 requests, 0 errors |
-| TTFP stability | Constant regardless of text length (spread < 1ms from 10 to 500 words) |
+| TTFP | Honest: text encoding deferred after first frame (not needed for it). Pipelined on background CUDA stream to overlap with frame 1 transfer |
 | Audio quality | Cosine similarity 0.9995 vs CUDA graph baseline (numerically identical) |
 
 ## How it works
@@ -31,15 +33,15 @@ The standard inference path uses ~70 separate CUDA kernel launches per decode st
 - **Predictor megakernel**: 5-layer transformer (HIDDEN=1024), 17 sequential steps for 16 codebook tokens. Pre-projected codec embeddings eliminate 16/17 projection ops.
 - **Talker megakernel**: 28-layer transformer (HIDDEN=2048), 1 step per frame. M-RoPE with pre-computed cos/sin tables.
 
-Both kernels are vendored in `csrc/` (1630 lines of CUDA C++) and compile from the same source with different compile-time dimensions. The predictor uses the default constants; the talker overrides via `-DMK_HIDDEN_SIZE=2048 -DMK_INTERMEDIATE_SIZE=6144`. Datacenter GPUs (H100/A100) use adaptive spin-wait barriers (pre-patched); consumer GPUs (RTX 5090/4090) use native spin-waits.
+Both kernels are vendored in `csrc/` (~1650 lines of CUDA C++ each) and compile from the same source with different compile-time dimensions. The predictor uses the default constants; the talker overrides via `-DMK_HIDDEN_SIZE=2048 -DMK_INTERMEDIATE_SIZE=6144`. All spin-wait barriers include adaptive `__nanosleep` for datacenter GPU compatibility (pre-patched).
 
 ### Other optimizations
 
 - **Prefix KV cache**: 480 voice/language/tone combos pre-computed at startup. Each request skips the ~50ms prefill.
 - **Codec raw mode**: sends 32 bytes of codec tokens per frame instead of decoded PCM audio. Client decodes locally.
-- **Pre-computed text encoding**: `compute_tth()` runs before the TTFP timer to ensure constant latency regardless of text length.
+- **Deferred text encoding**: `_compute_tth()` is not needed for the first frame (which comes from cached KV + sampling + predictor). It runs on a background CUDA stream after the first yield, overlapping with the first frame's `.cpu()` sync + network transfer. Results are LRU-cached (200 entries) for repeat texts.
 - **WebSocket streaming**: `chunk_size=1` emits audio at the first codec token.
-- **Honest TTFP measurement**: measured after `.cpu()` sync (not CPU queue time).
+- **Honest TTFP measurement**: timer starts at request receipt, stops after first frame `.cpu()` GPU sync. No pre-computation — text encoding is architecturally not on the critical path for frame 1.
 
 ## Quick start
 
@@ -58,7 +60,7 @@ export $(cat .env | xargs)
 python deploy/launch.py
 ```
 
-Creates a GPU pod that auto-clones this repo, installs dependencies, downloads the model, clones + patches the megakernel, builds 480 KV caches, and starts the server. Fully self-contained — no manual file setup needed. ~30s on H100.
+Creates a GPU pod that auto-clones this repo, installs dependencies, downloads the model, compiles the megakernels, builds 480 KV caches, and starts the server. Fully self-contained — no manual file setup needed. ~30s on H100.
 
 ### 3. Benchmark
 
@@ -132,21 +134,24 @@ Subsequent requests reuse the cached clone with just `"clone_id": "my-voice"`.
 | File | Description |
 |------|-------------|
 | `deploy/runpod_server.py` | Production TTS server (FastAPI + WebSocket + megakernels + voice cloning) |
-| `deploy/launch.py` | One-click RunPod deployment |
-| `deploy/start.sh` | Pod startup (install deps, clone megakernel repo, patch, start server) |
+| `deploy/launch.py` | One-click RunPod deployment (GPU priority: B200 > H200 > H100 > L40S) |
+| `deploy/start.sh` | Pod startup script (install deps, compile megakernels, start server) |
 | `deploy/benchmark_ws.py` | Client-side TTFP benchmark |
 | `deploy/robust_client.py` | Production client with hedging + local cache |
 | `deploy/stress_test.py` | 500-request stability test |
 | `deploy/generate_samples.py` | Generate audio samples via running server |
-| `csrc/kernel.cu` | **Fused CUDA megakernel** — 1630 lines, all 5/28 transformer layers in one persistent kernel launch. Pre-patched with adaptive spin-wait for datacenter GPUs. |
-| `csrc/kernel_talker.cu` | Talker variant with overridable dimensions (HIDDEN=2048, INTER=6144) |
+| `csrc/kernel.cu` | **Predictor megakernel** — fused 5-layer transformer in one persistent kernel launch. Pre-patched with adaptive spin-wait for datacenter GPUs. |
+| `csrc/kernel_talker.cu` | **Talker megakernel** — fused 28-layer transformer with compile-time configurable dimensions (HIDDEN=2048, INTER=6144) |
 | `csrc/torch_bindings.cpp` | PyTorch C++ bindings for the CUDA kernels |
-| `deploy/industrial/model_tts.py` | `CodePredictorKernel` class — weight packing, KV cache, decode loop |
+| `deploy/industrial/model_tts.py` | `CodePredictorKernel` / `TTSDecoder` classes — weight packing, KV cache, decode loop |
 | `deploy/industrial/build_predictor.py` | Predictor megakernel JIT compilation |
 | `deploy/industrial/build_talker_megakernel.py` | Talker megakernel JIT compilation |
-| `deploy/industrial/megakernel_predictor.py` | 1.7B predictor wrapper (2048→1024 projection) |
+| `deploy/industrial/megakernel_predictor.py` | 1.7B predictor wrapper (2048->1024 projection) |
 | `deploy/industrial/bench_honest_ttfp.py` | GPU-synchronized TTFP verification benchmark |
+| `deploy/industrial/patch_kernel_datacenter.py` | Datacenter GPU patch (adaptive spin-wait for A100/H100/B200) |
+| `deploy/industrial/mega_graph.py` | Fused CUDA graph: sampling + predictor + talker in one replay |
 | `deploy/industrial/patch_int8.py` | INT8 quantization kernel patch (experimental) |
+| `deploy/industrial/mrope_fix.md` | M-RoPE specification and kernel fix notes |
 
 ## Requirements
 
@@ -154,8 +159,8 @@ Subsequent requests reuse the cached clone with just `"clone_id": "my-voice"`.
 
 **Server** (auto-installed on RunPod):
 - Docker image: `runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04`
-- `faster-qwen3-tts`, `soundfile`, `ninja`
-- GPU: RTX 5090 (fastest), H100, H200, B200, A100 (16GB+ VRAM)
+- `faster-qwen3-tts`, `qwen-tts`, `soundfile`, `ninja`
+- GPU: B200 (recommended), H200, H100, A100, RTX 5090/4090 (16GB+ VRAM)
 
 ## License
 

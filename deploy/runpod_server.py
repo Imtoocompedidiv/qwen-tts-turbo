@@ -438,6 +438,9 @@ def _compute_tth(text):
 
 _last_cache_key = [None]  # Track last KV combo loaded in static cache
 
+_tth_stream = torch.cuda.Stream()
+
+
 @torch.inference_mode()
 def generate_cached_codec(text, voice="Vivian", language="French",
                            instruct="", chunk_size=1):
@@ -445,6 +448,12 @@ def generate_cached_codec(text, voice="Vivian", language="French",
     Yield raw codec token tensors (no speech_tokenizer decode).
     Selects the right KV cache based on instruct/tone.
     Skips KV restore if same combo as last request.
+
+    TTFP architecture: text encoding (tth) is deferred to after the first
+    yield because the first frame depends only on cached KV + sampling +
+    predictor megakernel. tth is first read at L+19 to build inputs_embeds
+    for the SECOND talker step. We pipeline it on a background CUDA stream
+    so the GPU projection overlaps with the first frame's network transfer.
     """
     # Normalize instruct for cache lookup (handle missing accents etc.)
     inst = instruct or ""
@@ -475,7 +484,7 @@ def generate_cached_codec(text, voice="Vivian", language="French",
     tc_tpe = tc["tpe"]
     tc_prefill_len = tc["prefill_len"]
 
-    tth_new = _compute_tth(text)
+    # tth is NOT computed here — deferred to after the first yield.
 
     # Skip KV restore if same combo as last request
     if _last_cache_key[0] != cache_key:
@@ -496,6 +505,9 @@ def generate_cached_codec(text, voice="Vivian", language="French",
 
     past_hidden = tc_past_hidden.clone()
     gen_step = tc_gen_step
+    tth_new = None
+    tth_event = None
+
     for step_idx in range(2048):
         if token.item() == cached_eos_id:
             break
@@ -508,7 +520,25 @@ def generate_cached_codec(text, voice="Vivian", language="French",
             codebook_token_ids = model.predictor_graph.run(pred_input)
         all_cb = torch.cat([token.view(1), codebook_token_ids])
 
-        yield all_cb  # no sync — .cpu() in WS handler does implicit sync
+        # Pipeline tth: kick off on background CUDA stream BEFORE yield.
+        # CPU tokenization runs now (~0.3ms); GPU projection dispatches to
+        # _tth_stream and overlaps with the caller's .cpu() + network send.
+        if tth_new is None and tth_event is None:
+            cached_tth = _tth_cache.get(text)
+            if cached_tth is not None:
+                tth_new = cached_tth
+            else:
+                tth_event = torch.cuda.Event()
+                with torch.cuda.stream(_tth_stream):
+                    tth_new = _compute_tth(text)
+                    tth_event.record()
+
+        yield all_cb  # TTFP: only KV restore + sample + predictor
+
+        # Sync background stream before reading tth_new
+        if tth_event is not None:
+            tth_event.synchronize()
+            tth_event = None
 
         codec_hiddens = [last_id_hidden]
         for ci in range(cached_num_code_groups - 1):
@@ -612,11 +642,15 @@ if USE_CACHE and prefill_cache:
     # First call primes everything — discard timing
     for _ in generate_cached_codec("Test."):
         break
-    # Second call gives real TTFP (tth pre-warmed, excluded from timing)
-    _compute_tth("Test.")
+    # Honest TTFP: fresh text, tth NOT pre-cached, deferred inside generator.
+    # The generator pipelines tth on a background CUDA stream after the first
+    # yield, so the TTFP only reflects: KV restore + sample + predictor.
+    # This is honest because tth genuinely isn't needed for the first frame.
+    _ttfp_text = "Bienvenue, comment puis-je vous aider aujourd'hui ?"
+    _tth_cache.pop(_ttfp_text, None)  # ensure not cached
     torch.cuda.synchronize()
     t_s = time.perf_counter()
-    for cb in generate_cached_codec("Test."):
+    for cb in generate_cached_codec(_ttfp_text):
         _ = cb.cpu()  # Force GPU sync for honest measurement
         cached_ttfp_ms = (time.perf_counter() - t_s) * 1000
         break
@@ -738,15 +772,20 @@ def _compute_clone_tth(text):
     return result
 
 
+_clone_tth_stream = torch.cuda.Stream()
+
+
 @torch.inference_mode()
 def generate_clone_cached_codec(text, clone_id, language="French"):
-    """Fast clone codec generation using cached KV (same pattern as CustomVoice)."""
+    """Fast clone codec generation using cached KV (same pattern as CustomVoice).
+
+    tth deferred to after first yield — same pipeline as generate_cached_codec.
+    """
     tc = _clone_prefill.get(clone_id)
     if tc is None:
         raise ValueError(f"Clone '{clone_id}' not found. Send ref_audio first.")
 
     cm = _get_clone_model()
-    tth_new = _compute_clone_tth(text)
 
     # Restore KV to clone model's static cache
     if _clone_last_key[0] != clone_id:
@@ -770,6 +809,8 @@ def generate_clone_cached_codec(text, clone_id, language="French"):
     codec_head = _clone_refs["codec_head"]
     pred_embeds = _clone_refs["pred_embeds"]
     num_cg = _clone_refs["num_code_groups"]
+    tth_new = None
+    tth_event = None
 
     for step_idx in range(2048):
         if token.item() == eos_id:
@@ -778,7 +819,23 @@ def generate_clone_cached_codec(text, clone_id, language="French"):
         pred_input = torch.cat((past_hidden, last_id_hidden), dim=1)
         codebook_token_ids = cm.predictor_graph.run(pred_input)
         all_cb = torch.cat([token.view(1), codebook_token_ids])
+
+        # Pipeline tth on background stream (same pattern as CustomVoice)
+        if tth_new is None and tth_event is None:
+            cached_tth = _clone_tth_cache.get(text)
+            if cached_tth is not None:
+                tth_new = cached_tth
+            else:
+                tth_event = torch.cuda.Event()
+                with torch.cuda.stream(_clone_tth_stream):
+                    tth_new = _compute_clone_tth(text)
+                    tth_event.record()
+
         yield all_cb
+
+        if tth_event is not None:
+            tth_event.synchronize()
+            tth_event = None
 
         codec_hiddens = [last_id_hidden]
         for ci in range(num_cg - 1):
@@ -862,13 +919,9 @@ async def websocket_tts(ws: WebSocket):
         sr = 24000
         _request_count += 1
 
-        # Pre-compute text encoding BEFORE starting TTFP timer.
-        # This ensures TTFP is constant regardless of text length.
-        # The tth cache (max 200 entries) makes repeat calls free.
-        if USE_CACHE and text:
-            _compute_tth(text)
-        if _clone_model is not None and text:
-            _compute_clone_tth(text)
+        # TTFP timer: text encoding is deferred inside generators (pipelined
+        # on a background CUDA stream, overlapping with first frame transfer).
+        # The timer captures the true end-to-end latency the client sees.
         torch.cuda.synchronize()
         t0_req = time.perf_counter()
 
