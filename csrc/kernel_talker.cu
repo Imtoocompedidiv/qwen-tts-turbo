@@ -118,7 +118,7 @@ struct AtomicGridSync {
       asm volatile("fence.acq_rel.gpu;" ::: "memory");
       unsigned int arrived = atomicAdd(counter, 1);
       if (arrived == nblocks - 1) {
-        *counter = 0;
+        atomicExch(counter, 0u);
         asm volatile("fence.acq_rel.gpu;" ::: "memory");
         atomicAdd(generation, 1);
       } else {
@@ -1235,17 +1235,18 @@ __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_persistent(
 
   // Reset barrier counters + flags on-device
   if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
+    atomicExch(barrier_counter, 0u);
+    atomicExch(barrier_sense, 0u);
     atomicExch(kv_flag, 0u);
     atomicExch(attn_flag, 0u);
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
     unsigned int arrived = atomicAdd(barrier_counter, 1);
     if (arrived == (unsigned int)num_blocks - 1) {
-      *barrier_counter = 0;
+      atomicExch(barrier_counter, 0u);
       asm volatile("fence.acq_rel.gpu;" ::: "memory");
       atomicAdd(barrier_sense, 1);
     } else {
@@ -1358,17 +1359,18 @@ __global__ void __launch_bounds__(LDG_BLOCK_SIZE, 1) ldg_decode_kernel_direct(
   int num_blocks = gridDim.x;
 
   if (block_id == 0 && threadIdx.x == 0) {
-    *barrier_counter = 0;
-    *barrier_sense = 0;
+    atomicExch(barrier_counter, 0u);
+    atomicExch(barrier_sense, 0u);
     atomicExch(kv_flag, 0u);
     atomicExch(attn_flag, 0u);
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
   }
   __syncthreads();
   if (threadIdx.x == 0) {
     asm volatile("fence.acq_rel.gpu;" ::: "memory");
     unsigned int arrived = atomicAdd(barrier_counter, 1);
     if (arrived == (unsigned int)num_blocks - 1) {
-      *barrier_counter = 0;
+      atomicExch(barrier_counter, 0u);
       asm volatile("fence.acq_rel.gpu;" ::: "memory");
       atomicAdd(barrier_sense, 1);
     } else {

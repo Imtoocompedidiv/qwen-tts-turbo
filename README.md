@@ -11,7 +11,7 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 TTFP = time from request receipt to first codec frame ready on GPU (after `.cpu()` sync). Text encoding is architecturally **deferred after the first frame** — the first frame depends only on cached KV + sampling + predictor megakernel. Text encoding is pipelined on a background CUDA stream, overlapping with frame 1 network transfer.
 
-> **Note:** The talker megakernel (`USE_TALKER_MK=1`) still deadlocks on long texts. Use `USE_TALKER_MK=0` (CUDA graph talker) with `USE_MEGAKERNEL=1` (megakernel predictor) for production. A100 (sm_80) requires `USE_MEGAKERNEL=0`. RTX 5090 is a consumer card — use datacenter GPUs (B200, H200, H100) for production.
+> **GPU compatibility:** The server auto-detects GPU capability at startup. On GPUs below sm_90 (A100, etc.), megakernels are automatically disabled and the server falls back to CUDA graph (16ms TTFP). Warmup includes a 30s deadlock watchdog — if a megakernel hangs, the server falls back gracefully. The default deployment (`start.sh`, `Dockerfile`) uses `USE_MEGAKERNEL=1 USE_TALKER_MK=0` (predictor megakernel + CUDA graph talker), which is the tested stable configuration.
 
 | Feature | Details |
 |---------|---------|

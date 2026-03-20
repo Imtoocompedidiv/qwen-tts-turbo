@@ -69,6 +69,16 @@ model.talker_graph.capture = _fast_talk
 print("CUDA graph capture...")
 model._warmup(10)
 
+# ── GPU capability check: disable megakernels on unsupported GPUs ──
+_gpu_cc = torch.cuda.get_device_capability()
+_gpu_arch = _gpu_cc[0] * 10 + _gpu_cc[1]
+_gpu_name = torch.cuda.get_device_name(0)
+
+if _gpu_arch < 90 and os.environ.get("USE_MEGAKERNEL", "0") == "1":
+    print(f"  GPU {_gpu_name} (sm_{_gpu_arch}) < sm_90: disabling megakernels")
+    os.environ["USE_MEGAKERNEL"] = "0"
+    os.environ["USE_TALKER_MK"] = "0"
+
 # ── Megakernel predictor (optional, ~1.9x faster) ─────────────────
 USE_MEGAKERNEL = os.environ.get("USE_MEGAKERNEL", "0") == "1"
 mk_predictor = None
@@ -146,10 +156,19 @@ if USE_MEGAKERNEL:
 
         mk_predictor = _MKPredictor(mk_kernel, proj_w, proj_b, proj_embed_w, proj_codec)
 
-        # Warmup
+        # Warmup with deadlock watchdog (30s timeout)
         dummy_h = torch.randn(1, 1, 2048, dtype=torch.bfloat16, device="cuda")
-        for _ in range(3):
-            mk_predictor.run(dummy_h, 0)
+        _warmup_ok = [False]
+        def _warmup_predictor():
+            for _ in range(3):
+                mk_predictor.run(dummy_h, 0)
+            torch.cuda.synchronize()
+            _warmup_ok[0] = True
+        _wt = threading.Thread(target=_warmup_predictor, daemon=True)
+        _wt.start()
+        _wt.join(timeout=30)
+        if not _warmup_ok[0]:
+            raise RuntimeError("Predictor megakernel warmup deadlocked (30s timeout)")
         print(f"  Megakernel predictor ready ({time.time()-t_mk:.1f}s)")
     except Exception as e:
         print(f"  Megakernel FAILED: {e} — falling back to CUDA graph predictor")
@@ -266,8 +285,17 @@ if USE_TALKER_MK:
 
         mk_talker = _MKTalker()
         dummy_ie = torch.randn(1, 1, _TALKER_HIDDEN, dtype=torch.bfloat16, device="cuda")
-        for _ in range(3):
-            mk_talker.step(dummy_ie, 0)
+        _talker_ok = [False]
+        def _warmup_talker():
+            for _ in range(3):
+                mk_talker.step(dummy_ie, 0)
+            torch.cuda.synchronize()
+            _talker_ok[0] = True
+        _tt = threading.Thread(target=_warmup_talker, daemon=True)
+        _tt.start()
+        _tt.join(timeout=30)
+        if not _talker_ok[0]:
+            raise RuntimeError("Talker megakernel warmup deadlocked (30s timeout)")
         print(f"  Talker megakernel ready ({time.time()-t_tmk:.1f}s)")
     except Exception as e:
         print(f"  Talker megakernel FAILED: {e} — falling back to CUDA graph")
