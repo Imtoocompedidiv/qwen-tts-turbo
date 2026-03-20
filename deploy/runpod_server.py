@@ -194,9 +194,9 @@ async def websocket_tts(ws: WebSocket):
                 text, voice, language, instruct, cs
             )
         elif engine.USE_CACHE:
-            gen = engine.generate_cached_streaming(
-                text, voice, language, instruct, cs
-            )
+            # PCM fast path: first frame is synchronous (no executor overhead),
+            # remaining frames go through async pipeline.
+            gen = None  # handled below via fast PCM path
         else:
             gen = engine.model.generate_custom_voice_streaming(
                 text=text,
@@ -211,6 +211,26 @@ async def websocket_tts(ws: WebSocket):
             monitor.last_frame_time[0] = time.monotonic()
             req_deadline = time.monotonic() + monitor.GENERATION_TIMEOUT
             loop = asyncio.get_event_loop()
+
+            # ── Fast PCM first frame: fused gen+decode, no executor ──
+            if gen is None and engine.USE_CACHE:
+                first_audio, sr, first_cb, codec_gen = \
+                    engine.generate_first_pcm_frame(text, voice, language, instruct)
+                monitor.last_frame_time[0] = time.monotonic()
+                chunk_count = 1
+                ttfp_ms = (time.perf_counter() - t0_req) * 1000
+                pcm = (first_audio * 32767).astype(np.int16).tobytes()
+                header = json.dumps(
+                    {"ttfp_ms": round(ttfp_ms, 1), "sr": sr}
+                ).encode()
+                await ws.send_bytes(
+                    struct.pack("<I", len(header)) + header + pcm
+                )
+                # Switch to streaming for remaining frames
+                gen = engine.generate_remaining_pcm(
+                    codec_gen, first_cb, len(first_audio), sr, cs
+                )
+
             gen_iter = iter(gen)
 
             # Couche 1: async frame loop with hard timeout on next(gen).
