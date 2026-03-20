@@ -31,7 +31,7 @@ The standard inference path uses ~70 separate CUDA kernel launches per decode st
 - **Predictor megakernel**: 5-layer transformer (HIDDEN=1024), 17 sequential steps for 16 codebook tokens. Pre-projected codec embeddings eliminate 16/17 projection ops.
 - **Talker megakernel**: 28-layer transformer (HIDDEN=2048), 1 step per frame. M-RoPE with pre-computed cos/sin tables.
 
-Both kernels compile from the same [qwen-megakernel-tts](https://github.com/jayanth-kumar-morem/qwen-megakernel-tts) source with different compile-time dimensions. Datacenter GPUs (H100/A100) use adaptive spin-wait barriers; consumer GPUs (RTX 5090/4090) use native spin-waits.
+Both kernels are vendored in `csrc/` (1630 lines of CUDA C++) and compile from the same source with different compile-time dimensions. The predictor uses the default constants; the talker overrides via `-DMK_HIDDEN_SIZE=2048 -DMK_INTERMEDIATE_SIZE=6144`. Datacenter GPUs (H100/A100) use adaptive spin-wait barriers (pre-patched); consumer GPUs (RTX 5090/4090) use native spin-waits.
 
 ### Other optimizations
 
@@ -138,9 +138,13 @@ Subsequent requests reuse the cached clone with just `"clone_id": "my-voice"`.
 | `deploy/robust_client.py` | Production client with hedging + local cache |
 | `deploy/stress_test.py` | 500-request stability test |
 | `deploy/generate_samples.py` | Generate audio samples via running server |
-| `deploy/industrial/patch_kernel_datacenter.py` | Datacenter GPU megakernel fix (adaptive spin-wait) |
-| `deploy/industrial/build_talker_megakernel.py` | Talker megakernel compilation (HIDDEN=2048, 28 layers) |
-| `deploy/industrial/megakernel_predictor.py` | Predictor megakernel wrapper (1.7B projection handling) |
+| `csrc/kernel.cu` | **Fused CUDA megakernel** — 1630 lines, all 5/28 transformer layers in one persistent kernel launch. Pre-patched with adaptive spin-wait for datacenter GPUs. |
+| `csrc/kernel_talker.cu` | Talker variant with overridable dimensions (HIDDEN=2048, INTER=6144) |
+| `csrc/torch_bindings.cpp` | PyTorch C++ bindings for the CUDA kernels |
+| `deploy/industrial/model_tts.py` | `CodePredictorKernel` class — weight packing, KV cache, decode loop |
+| `deploy/industrial/build_predictor.py` | Predictor megakernel JIT compilation |
+| `deploy/industrial/build_talker_megakernel.py` | Talker megakernel JIT compilation |
+| `deploy/industrial/megakernel_predictor.py` | 1.7B predictor wrapper (2048→1024 projection) |
 | `deploy/industrial/bench_honest_ttfp.py` | GPU-synchronized TTFP verification benchmark |
 | `deploy/industrial/patch_int8.py` | INT8 quantization kernel patch (experimental) |
 

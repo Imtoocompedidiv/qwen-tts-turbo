@@ -76,9 +76,9 @@ mk_predictor = None
 if USE_MEGAKERNEL:
     try:
         import sys as _sys
-        _sys.path.insert(0, "/workspace/megakernel-tts")
+        _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
         import torch.nn.functional as _F
-        from qwen_megakernel.model_tts import CodePredictorKernel
+        from deploy.industrial.model_tts import CodePredictorKernel
 
         print("Building megakernel predictor...")
         t_mk = time.time()
@@ -168,7 +168,7 @@ if USE_TALKER_MK:
         _sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "industrial"))
         from build_talker_megakernel import get_talker_extension
         print("Building talker megakernel...")
-        get_talker_extension("/workspace/megakernel-tts")
+        get_talker_extension()
 
         _TALKER_LAYERS = 28
         _TALKER_HIDDEN = 2048
