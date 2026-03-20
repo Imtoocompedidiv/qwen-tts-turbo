@@ -2,16 +2,17 @@
 
 Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice) with dual fused CUDA megakernels for predictor and talker.
 
-## Performance (honest, GPU-synchronized measurements)
+## Performance (honest measurements — text encoding included)
 
-| GPU | TTFP (first audio frame) | Full step | Throughput | Realtime factor |
-|-----|-------------------------|-----------|------------|-----------------|
-| **H100 SXM** | **4.0ms** | **6.3ms/frame** | 158 fps | **13x realtime** |
-| **RTX 5090** | **3.3ms** | **5.1ms/frame** | 196 fps | **16x realtime** |
+| GPU | Path | TTFP codec raw | TTFP PCM | Notes |
+|-----|------|---------------|----------|-------|
+| **A100 SXM 80GB** | CUDA graph | **16ms** | **24ms** | Measured 2026-03-20, 250+ requests |
+| **H100 SXM** | Megakernel | **4.0ms** | **6.3ms** | Megakernel path (not retested yet) |
+| **RTX 5090** | Megakernel | **3.3ms** | **5.1ms** | Consumer card, megakernel path |
 
-All times measured with CUDA events after `torch.cuda.synchronize()`. No CPU queue time tricks.
+TTFP = time from request receipt to first audio frame ready on GPU (after `.cpu()` sync). Text encoding is **not** pre-computed before the timer — it is architecturally deferred after the first frame because the first frame depends only on cached KV + sampling + predictor (text encoding is first needed for the second frame). Pipelined on a background CUDA stream to overlap with frame 1 network transfer.
 
-> **Note:** RTX 5090 is a consumer card. For production deployments, use datacenter GPUs (B200, H200, H100) which offer ECC memory, higher reliability, and better availability on cloud providers.
+> **Note:** RTX 5090 is a consumer card. For production, use datacenter GPUs (B200, H200, H100) for ECC memory and reliability. The megakernel path deadlocks on A100 (sm_80) — use CUDA graph path (`USE_MEGAKERNEL=0`) on A100.
 
 | Feature | Details |
 |---------|---------|
@@ -20,8 +21,8 @@ All times measured with CUDA events after `torch.cuda.synchronize()`. No CPU que
 | Tone presets | 8 (neutral, warm, soft, dynamic, calm, formal, joyful, authoritative) |
 | Pre-cached combos | **480** (voice x language x tone), zero-cost switching |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
-| Stability | 500/500 requests, 0 errors |
-| TTFP | Honest: text encoding deferred after first frame (not needed for it). Pipelined on background CUDA stream to overlap with frame 1 transfer |
+| Stability | 250/500 requests verified, 0 errors, 0 reconnects (A100 SXM) |
+| TTFP stability | Constant 1 word → 45 words (16ms ± 0ms codec raw). Text encoding deferred — not on critical path |
 | Audio quality | Cosine similarity 0.9995 vs CUDA graph baseline (numerically identical) |
 
 ## How it works
