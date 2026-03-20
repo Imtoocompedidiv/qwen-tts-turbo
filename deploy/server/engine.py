@@ -648,10 +648,26 @@ class TTSEngine:
             }
 
     def _prime_pipeline(self):
-        """Prime the pipeline (1 cached codec call to warm GPU caches)."""
+        """Prime the pipeline: codec generation + speech tokenizer decode."""
+        # 1. Warm codec generation path
         for _ in self.generate_cached_codec("Test."):
             break
-        # Honest TTFP: fresh text, tth NOT pre-cached, deferred inside generator.
+
+        # 2. Warm speech tokenizer decode (vocoder) — critical for PCM TTFP.
+        # Cold vocoder is ~4x slower than warmed (13ms vs 3.5ms on RTX 5090).
+        speech_tokenizer = self.inner.speech_tokenizer
+        print("  Warming up speech tokenizer decode...")
+        dummy_codes = torch.randint(0, 2048, (1, 16), device=self.device)
+        for _ in range(5):
+            speech_tokenizer.decode({"audio_codes": dummy_codes.unsqueeze(0)})
+        # Also warm with real codec tokens from a short generation
+        for cb in self.generate_cached_codec("Test."):
+            speech_tokenizer.decode({"audio_codes": cb.unsqueeze(0).unsqueeze(0)})
+            break
+        torch.cuda.synchronize()
+        print("  Speech tokenizer decode warmed up")
+
+        # 3. Measure honest TTFP (codec raw)
         _ttfp_text = "Bienvenue, comment puis-je vous aider aujourd'hui ?"
         self._tth_cache.pop(_ttfp_text, None)
         torch.cuda.synchronize()
