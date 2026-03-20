@@ -1506,6 +1506,16 @@ extern "C" void launch_ldg_decode_direct(
   ldg_configure_kernel_attributes();
   ensure_barrier_alloc();
 
+  // Reset all barrier state on the stream BEFORE kernel launch.
+  // The kernel's in-kernel reset (block 0) races with other blocks:
+  // barrier_sense may hold a stale value M from the previous invocation,
+  // causing non-zero blocks to see M != 0 in the initial spin-wait and
+  // skip the barrier entirely. Host-side memset eliminates this race.
+  cudaMemsetAsync(d_barrier_counter, 0, sizeof(unsigned int), stream);
+  cudaMemsetAsync(d_barrier_sense, 0, sizeof(unsigned int), stream);
+  cudaMemsetAsync(d_kv_flag, 0, sizeof(unsigned int), stream);
+  cudaMemsetAsync(d_attn_flag, 0, sizeof(unsigned int), stream);
+
   ldg_decode_kernel_direct<<<LDG_NUM_BLOCKS, LDG_BLOCK_SIZE, 0, stream>>>(
       (const __nv_bfloat16 *)embed_weight, layer_weights,
       (const __nv_bfloat16 *)final_norm_weight,
