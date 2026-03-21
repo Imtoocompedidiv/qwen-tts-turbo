@@ -16,6 +16,9 @@ if [ ! -f "$REPO_DIR/deploy/runpod_server.py" ]; then
     echo "Cloning qwen-tts-turbo..."
     rm -rf "$REPO_DIR"
     git clone --depth 1 "$REPO_URL" "$REPO_DIR"
+else
+    echo "Updating qwen-tts-turbo..."
+    cd "$REPO_DIR" && git fetch --depth 1 origin master && git reset --hard origin/master && cd /
 fi
 
 # Install dependencies
