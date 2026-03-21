@@ -4,25 +4,23 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 ## Performance (verified 2026-03-21)
 
-| GPU | TTFP (first playable PCM) | Stress test | Config |
-|-----|--------------------------|-------------|--------|
-| **RTX 5090** (sm_120) | **~16ms** p50 | 500/500, 0 errors, 0MB drift | MK predictor + CUDA graph talker |
-| **H100 SXM** (sm_90) | **~17ms** p50 | All texts 1w→45w verified | MK predictor + CUDA graph talker |
-| **A100 SXM** (sm_80) | **~25ms** p50 | 250+ requests verified | CUDA graph only (auto-detected) |
+| GPU | Server TTFP (PCM) | Server TTFP (codec raw) | Client TTFP (EU) | Config |
+|-----|-------------------|------------------------|-----------------|--------|
+| **RTX 5090** (sm_120) | **9ms** p50 | **3ms** p50 | **65ms** p50 | MK predictor + MK talker |
+| **H100 PCIe** (sm_90) | **30ms** p50 | **6ms** p50 | — (tested US only) | MK predictor + CUDA graph talker |
+| **A100 SXM** (sm_80) | ~25ms p50 | ~16ms p50 | — | CUDA graph only (auto-detected) |
 
-TTFP = time from request receipt to first PCM audio chunk fully conditioned on the real text, voice, language, and instruct parameters. Text encoding (TTH) runs eagerly on a background CUDA stream, pipelined with KV restore, and synced **before** the first yield. Benchmarks need re-running to confirm exact numbers post-architecture change.
+TTFP = time from request receipt to first PCM audio chunk fully conditioned on the real text, voice, language, and instruct parameters. Text encoding (TTH) runs eagerly on a background CUDA stream, pipelined with KV restore, and synced **before** the first yield.
 
-### TTFP breakdown (RTX 5090, estimated)
+### TTFP breakdown (RTX 5090, measured)
 
 ```
-Honest TTFP (~16ms):
-  [TTH on background stream ~1-2ms] ──overlap──▶
-  [KV restore ~0.5ms] [sample 0.3ms] [TTH sync] [predictor 3ms] [vocoder 12ms]
+Server PCM (9ms):  [TTH overlap] [sample 0.3ms] [MK predictor 3ms] [vocoder ~6ms]
+Server codec (3ms): [TTH overlap] [sample 0.3ms] [MK predictor 3ms]
+Client (65ms):      [server 9ms] + [network EU ~56ms]
 ```
 
-The TTH (text encoding) is computed eagerly on a background CUDA stream while KV restore and first token sampling run on the default stream. The sync point ensures text conditioning is ready before the first yield — adding ~0-2ms vs the previous deferred architecture depending on TTH cache hit.
-
-The vocoder (speech_tokenizer.decode) remains the bottleneck at ~75% of TTFP. Tested: torch.compile, CUDA graph capture, fp16, batching, background stream — none reduce single-frame decode time.
+Both megakernels active: predictor (5-layer, 15 codebook steps) + talker (28-layer, per-token decode). TTH (text encoding) runs eagerly on a background CUDA stream, pipelined with KV restore, synced before first yield.
 
 > **GPU auto-detection:** The server detects sm_arch at startup. Below sm_90 (A100, etc.), megakernels are auto-disabled with CUDA graph fallback. Warmup includes a 30s deadlock watchdog. Runtime frame timeout (10s) auto-disables megakernels after 3 failures. External liveness probe in start.sh kills hung processes.
 
@@ -34,7 +32,7 @@ The vocoder (speech_tokenizer.decode) remains the bottleneck at ~75% of TTFP. Te
 | Pre-cached combos | **480** (voice x language x tone), zero-cost switching. Custom tones built on-the-fly in background, cached for subsequent requests |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
 | Stability | **500/500** requests on RTX 5090, 0 errors, 0 reconnects, 0MB GPU memory drift, CV=4.3% |
-| TTFP stability | Constant 1 word → 45 words (needs re-benchmarking with honest TTFP) |
+| TTFP stability | Constant 1 word → 45 words (srv 3ms ± 0ms codec raw, 9ms ± 1ms PCM) |
 | Audio quality | Cosine similarity 0.9995 vs CUDA graph baseline (numerically identical) |
 
 ## Architecture
@@ -153,7 +151,7 @@ Server responds with binary frames, then a final JSON:
 | `deploy/runpod_server.py` | Slim entry point: FastAPI + WebSocket handler (430 lines) |
 | `deploy/server/engine.py` | `TTSEngine` class: model, megakernels, caches, generation (1242 lines) |
 | `deploy/server/monitoring.py` | `ServerMonitor` class: metrics, watchdog, auto-fallback (113 lines) |
-| `deploy/launch.py` | One-click RunPod deployment (GPU priority: B200 > H200 > H100 > A100 > L40S) |
+| `deploy/launch.py` | One-click RunPod deployment (GPU priority: RTX 5090 > H100 PCIe > H100 SXM > H200 > B200) |
 | `deploy/start.sh` | Supervised startup: pre-flight checks, restart loop, liveness probe |
 | `deploy/benchmark_ws.py` | TTFP benchmark (PCM + codec raw + multi-tone) |
 | `deploy/robust_client.py` | Production client with hedging + local cache |
