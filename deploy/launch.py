@@ -89,10 +89,10 @@ def create_pod():
     print(f"Balance: ${balance:.2f}")
 
     REPO_URL = "https://github.com/Imtoocompedidiv/qwen-tts-turbo.git"
-    # Self-contained startup: clone repo then run start.sh
+    # start.sh handles clone idempotently — safe across restarts
     STARTUP_CMD = [
         "bash", "-c",
-        f"git clone --depth 1 {REPO_URL} /workspace/qwen-tts-turbo && "
+        f"[ -d /workspace/qwen-tts-turbo ] || git clone --depth 1 {REPO_URL} /workspace/qwen-tts-turbo; "
         f"bash /workspace/qwen-tts-turbo/deploy/start.sh",
     ]
 
