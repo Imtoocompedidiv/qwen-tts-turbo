@@ -2,8 +2,7 @@
 set -e
 
 # ── Fast self-contained startup with supervised restart + liveness probe ──
-# Target: cold start in ~3-4 minutes (was 15-20 minutes).
-# Parallelizes: pip install || model download || CUDA kernel pre-compile.
+# Dependency order: pip install FIRST, then model download + kernel compile in parallel.
 
 REPO_DIR="/workspace/qwen-tts-turbo"
 REPO_URL="https://github.com/Imtoocompedidiv/qwen-tts-turbo.git"
@@ -31,21 +30,20 @@ print(f'  GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
 assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
 " || { echo "FATAL: Pre-flight failed"; exit 1; }
 
-# ── Parallel setup: pip + model download + kernel compile ──────────────
-echo "Parallel setup starting..."
+echo "Setup starting..."
 t0=$(date +%s)
 
-# 1) pip install (skip PyTorch, already in image)
-_pip_install() {
-    python3 -c "import faster_qwen3_tts" 2>/dev/null && echo "  [pip] already installed" && return 0
+# ── Step 1: pip install (must complete before anything else) ────────────
+if ! python3 -c "import faster_qwen3_tts" 2>/dev/null; then
     echo "  [pip] installing..."
-    pip install --no-deps -q faster-qwen3-tts qwen-tts 2>/dev/null
-    # Install only missing lightweight deps (skip torch, numpy, etc already in image)
-    pip install -q transformers accelerate safetensors tokenizers soundfile ninja websockets 2>/dev/null
+    pip install --no-deps -q faster-qwen3-tts qwen-tts 2>&1 | tail -1
+    pip install -q transformers accelerate safetensors tokenizers soundfile ninja websockets 2>&1 | tail -1
     echo "  [pip] done"
-}
+else
+    echo "  [pip] already installed"
+fi
 
-# 2) Download model weights
+# ── Step 2: model download + kernel compile IN PARALLEL ─────────────────
 _download_model() {
     local model_dir="/workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     if [ -d "$model_dir" ] && [ -f "$model_dir/model.safetensors" ]; then
@@ -59,17 +57,10 @@ snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
                   local_dir='/workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice',
                   ignore_patterns=['*.md'])
 print('  [model] done')
-"
+" || { echo "  [model] FAILED (will download at server startup)"; return 0; }
 }
 
-# 3) Pre-compile CUDA kernels (JIT cache persists in /root/.cache/torch_extensions)
 _compile_kernels() {
-    if python3 -c "import torch; torch.ops.load_library" 2>/dev/null && \
-       [ -d "/root/.cache/torch_extensions" ] && \
-       find /root/.cache/torch_extensions -name "qwen_megakernel_C*" -newer "$REPO_DIR/csrc/kernel.cu" 2>/dev/null | grep -q .; then
-        echo "  [kernels] already compiled"
-        return 0
-    fi
     echo "  [kernels] compiling predictor megakernel..."
     python3 -c "
 import sys
@@ -77,21 +68,14 @@ sys.path.insert(0, '$REPO_DIR')
 from deploy.industrial.build_predictor import get_predictor_extension
 get_predictor_extension()
 print('  [kernels] done')
-"
+" || { echo "  [kernels] FAILED (will JIT compile at server startup)"; return 0; }
 }
 
-# Run all three in parallel
-_pip_install &
-pid_pip=$!
 _download_model &
 pid_model=$!
-
-# Wait for pip before compiling kernels (needs faster_qwen3_tts imported by engine)
-wait $pid_pip
 _compile_kernels &
 pid_kernels=$!
 
-# Wait for all
 wait $pid_model
 wait $pid_kernels
 
