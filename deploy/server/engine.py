@@ -797,11 +797,10 @@ class TTSEngine:
         Selects the right KV cache based on instruct/tone.
         Skips KV restore if same combo as last request.
 
-        TTFP architecture: text encoding (tth) is deferred to after the first
-        yield because the first frame depends only on cached KV + sampling +
-        predictor megakernel. tth is first read at L+19 to build inputs_embeds
-        for the SECOND talker step. We pipeline it on a background CUDA stream
-        so the GPU projection overlaps with the first frame's network transfer.
+        Honest TTFP: text encoding (TTH) is computed eagerly on a background
+        CUDA stream, overlapping with KV restore and first token sampling,
+        then synced BEFORE the first yield. The first frame is fully conditioned
+        on real text + voice + language + instruct parameters.
         """
         inst = instruct or ""
         cache_key = (voice, language, inst)
@@ -843,6 +842,19 @@ class TTSEngine:
         tc_tpe = tc["tpe"]
         tc_prefill_len = tc["prefill_len"]
 
+        # ── Eager TTH: start text encoding on background CUDA stream NOW,
+        # so it overlaps with KV restore + first token sampling below.
+        cached_tth = self._tth_cache.get(text)
+        if cached_tth is not None:
+            tth_new = cached_tth
+            tth_event = None
+        else:
+            tth_event = torch.cuda.Event()
+            with torch.cuda.stream(self._tth_stream):
+                tth_new = self._compute_tth(text)
+                tth_event.record()
+
+        # ── KV restore (overlaps with TTH on background stream) ──
         if self._last_cache_key[0] != cache_key:
             if self.mk_talker is not None:
                 self.mk_talker.restore_kv(tc_kv, tc_prefill_len)
@@ -867,8 +879,11 @@ class TTSEngine:
 
         past_hidden = tc_past_hidden.clone()
         gen_step = tc_gen_step
-        tth_new = None
-        tth_event = None
+
+        # ── Sync TTH before first yield — honest TTFP includes text encoding ──
+        if tth_event is not None:
+            tth_event.synchronize()
+            tth_event = None
 
         for step_idx in range(2048):
             if token.item() == self.cached_eos_id:
@@ -884,23 +899,7 @@ class TTSEngine:
                 codebook_token_ids = self.model.predictor_graph.run(pred_input)
             all_cb = torch.cat([token.view(1), codebook_token_ids])
 
-            # Pipeline tth: kick off on background CUDA stream BEFORE yield.
-            if tth_new is None and tth_event is None:
-                cached_tth = self._tth_cache.get(text)
-                if cached_tth is not None:
-                    tth_new = cached_tth
-                else:
-                    tth_event = torch.cuda.Event()
-                    with torch.cuda.stream(self._tth_stream):
-                        tth_new = self._compute_tth(text)
-                        tth_event.record()
-
-            yield all_cb  # TTFP: only KV restore + sample + predictor
-
-            # Sync background stream before reading tth_new
-            if tth_event is not None:
-                tth_event.synchronize()
-                tth_event = None
+            yield all_cb
 
             codec_hiddens = [last_id_hidden]
             for ci in range(self.cached_num_code_groups - 1):
@@ -1142,7 +1141,7 @@ class TTSEngine:
     def generate_clone_cached_codec(self, text, clone_id, language="French"):
         """Fast clone codec generation using cached KV (same pattern as CustomVoice).
 
-        tth deferred to after first yield — same pipeline as generate_cached_codec.
+        Eager TTH: text encoding computed before first yield (honest TTFP).
         """
         tc = self._clone_prefill.get(clone_id)
         if tc is None:
@@ -1151,6 +1150,17 @@ class TTSEngine:
             )
 
         cm = self._get_clone_model()
+
+        # ── Eager TTH on background stream (overlaps with KV restore) ──
+        cached_tth = self._clone_tth_cache.get(text)
+        if cached_tth is not None:
+            tth_new = cached_tth
+            tth_event = None
+        else:
+            tth_event = torch.cuda.Event()
+            with torch.cuda.stream(self._clone_tth_stream):
+                tth_new = self._compute_clone_tth(text)
+                tth_event.record()
 
         if self._clone_last_key[0] != clone_id:
             for layer_idx, (k, v) in enumerate(tc["kv"]):
@@ -1181,8 +1191,11 @@ class TTSEngine:
         codec_head = self._clone_refs["codec_head"]
         pred_embeds = self._clone_refs["pred_embeds"]
         num_cg = self._clone_refs["num_code_groups"]
-        tth_new = None
-        tth_event = None
+
+        # ── Sync TTH before first yield ──
+        if tth_event is not None:
+            tth_event.synchronize()
+            tth_event = None
 
         for step_idx in range(2048):
             if token.item() == eos_id:
@@ -1192,21 +1205,7 @@ class TTSEngine:
             codebook_token_ids = cm.predictor_graph.run(pred_input)
             all_cb = torch.cat([token.view(1), codebook_token_ids])
 
-            # Pipeline tth on background stream (same pattern as CustomVoice)
-            if tth_new is None and tth_event is None:
-                cached_tth = self._clone_tth_cache.get(text)
-                if cached_tth is not None:
-                    tth_new = cached_tth
-                else:
-                    tth_event = torch.cuda.Event()
-                    with torch.cuda.stream(self._clone_tth_stream):
-                        tth_new = self._compute_clone_tth(text)
-                        tth_event.record()
-
             yield all_cb
-
-            if tth_event is not None:
-                tth_event.synchronize()
                 tth_event = None
 
             codec_hiddens = [last_id_hidden]
