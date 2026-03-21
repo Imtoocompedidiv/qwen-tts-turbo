@@ -214,13 +214,40 @@ async def websocket_tts(ws: WebSocket):
 
             gen_iter = iter(gen)
 
-            # First frame: direct call bypasses executor dispatch (~0.5ms
-            # saved). Blocks event loop for ~3-9ms — acceptable for TTFP.
-            # Subsequent frames use executor for deadlock safety.
-            item = _safe_next(gen_iter)
-            is_first = True
+            # Couche 1: async frame loop with hard timeout on next(gen).
+            # run_in_executor moves the blocking next() call to a thread.
+            # wait_for enforces the deadline BEFORE Python blocks.
+            # If CUDA deadlocks, wait_for raises TimeoutError while the
+            # stuck thread is abandoned (watchdog couche 2 handles cleanup).
+            while True:
+                if time.monotonic() > req_deadline:
+                    raise RuntimeError(
+                        f"Request timeout ({monitor.GENERATION_TIMEOUT}s)"
+                    )
 
-            while item is not _GEN_SENTINEL:
+                try:
+                    item = await asyncio.wait_for(
+                        loop.run_in_executor(
+                            _gen_pool, _safe_next, gen_iter
+                        ),
+                        timeout=monitor.FRAME_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    monitor.mk_failure_count += 1
+                    if (
+                        engine.mk_predictor is not None
+                        and monitor.mk_failure_count
+                        >= monitor.MK_FAILURE_THRESHOLD
+                    ):
+                        monitor._auto_disable_megakernel()
+                    raise RuntimeError(
+                        f"Frame timeout ({monitor.FRAME_TIMEOUT}s), probable deadlock "
+                        f"(mk_failures: {monitor.mk_failure_count})"
+                    )
+
+                if item is _GEN_SENTINEL:
+                    break  # Generator exhausted
+
                 monitor.last_frame_time[0] = time.monotonic()
                 chunk_count += 1
 
@@ -266,34 +293,6 @@ async def websocket_tts(ws: WebSocket):
 
                 if chunk_count % 10 == 0:
                     await asyncio.sleep(0)
-
-                # Fetch next frame: direct call was first only,
-                # subsequent frames go through executor for deadlock safety
-                if is_first:
-                    is_first = False
-                if time.monotonic() > req_deadline:
-                    raise RuntimeError(
-                        f"Request timeout ({monitor.GENERATION_TIMEOUT}s)"
-                    )
-                try:
-                    item = await asyncio.wait_for(
-                        loop.run_in_executor(
-                            _gen_pool, _safe_next, gen_iter
-                        ),
-                        timeout=monitor.FRAME_TIMEOUT,
-                    )
-                except asyncio.TimeoutError:
-                    monitor.mk_failure_count += 1
-                    if (
-                        engine.mk_predictor is not None
-                        and monitor.mk_failure_count
-                        >= monitor.MK_FAILURE_THRESHOLD
-                    ):
-                        monitor._auto_disable_megakernel()
-                    raise RuntimeError(
-                        f"Frame timeout ({monitor.FRAME_TIMEOUT}s), probable deadlock "
-                        f"(mk_failures: {monitor.mk_failure_count})"
-                    )
 
             monitor.generation_active[0] = False
             total_ms = (time.perf_counter() - t0_req) * 1000
