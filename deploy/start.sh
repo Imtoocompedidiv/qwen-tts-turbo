@@ -29,7 +29,8 @@ import torch
 assert torch.cuda.is_available(), 'No CUDA GPU'
 cc = torch.cuda.get_device_capability()
 name = torch.cuda.get_device_name(0)
-mem = torch.cuda.get_device_properties(0).total_mem / 1024**3
+props = torch.cuda.get_device_properties(0)
+mem = (getattr(props, 'total_memory', 0) or getattr(props, 'total_mem', 0)) / 1024**3
 print(f'  GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
 assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
 " || { echo "FATAL: Pre-flight failed"; exit 1; }
