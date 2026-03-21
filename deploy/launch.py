@@ -23,10 +23,21 @@ API_KEY = os.environ.get("RUNPOD_API_KEY", "")
 VOLUME_ID = os.environ.get("RUNPOD_VOLUME_ID", "")
 VOLUMES = {os.environ.get("RUNPOD_DC", "EU-NL-1"): VOLUME_ID} if VOLUME_ID else {}
 IMAGE = "runpod/pytorch:2.8.0-py3.11-cuda12.8.1-cudnn-devel-ubuntu22.04"
+# Ordered by cost-effectiveness for this TTS workload:
+# - All sm_90+ GPUs have megakernel support and similar TTFP (~16-17ms)
+#   so we prefer cheapest first (RTX 5090 ~ $0.50/h vs B200 ~ $5/h)
+# - sm_80 (A100) falls back to CUDA graph (~25ms), still usable
+# - sm_89 (L40S, RTX 4090) also CUDA graph fallback
 GPU_CHAIN = [
-    "NVIDIA B200", "NVIDIA H200",
-    "NVIDIA H100 80GB HBM3", "NVIDIA H100 PCIe",
+    # sm_90+ with megakernel (cheapest first, ~same performance)
+    "NVIDIA GeForce RTX 5090",
+    "NVIDIA H100 PCIe",
+    "NVIDIA H100 80GB HBM3",
+    "NVIDIA H200",
+    "NVIDIA B200",
+    # sm_80+ fallback (CUDA graph, no megakernel)
     "NVIDIA A100-SXM4-80GB", "NVIDIA A100 80GB PCIe",
+    "NVIDIA GeForce RTX 4090",
     "NVIDIA L40S",
 ]
 SSH_KEY = os.environ.get("RUNPOD_SSH_KEY", "")
@@ -149,7 +160,7 @@ def create_pod():
 
 def wait_ready(pod_id):
     print("Waiting for server...")
-    for i in range(120):
+    for i in range(180):  # 180 × 5s = 15 minutes (cold start without volume)
         pod = graphql(f'{{ pod(input: {{podId: "{pod_id}"}}) {{ desiredStatus runtime {{ ports {{ ip publicPort privatePort }} }} }} }}')
         pod_data = pod.get("data", {}).get("pod", {})
         _, tcp = get_urls(pod_data)
@@ -177,7 +188,7 @@ def wait_ready(pod_id):
             print(f"  [{i*5}s] still starting...")
         time.sleep(5)
 
-    print("ERROR: Server did not start in 10 minutes")
+    print("ERROR: Server did not start in 15 minutes")
     sys.exit(1)
 
 
