@@ -654,15 +654,20 @@ class TTSEngine:
             break
 
         # 2. Warm speech tokenizer decode (vocoder) — critical for PCM TTFP.
-        # Cold vocoder is ~4x slower than warmed (13ms vs 3.5ms on RTX 5090).
+        # Cold vocoder adds ~10ms penalty. We warm with VARIED tokens (not
+        # the same dummy repeated, which only warms the vocoder's internal
+        # cache for that specific input — misleading in benchmarks).
         speech_tokenizer = self.inner.speech_tokenizer
         print("  Warming up speech tokenizer decode...")
-        dummy_codes = torch.randint(0, 2048, (1, 16), device=self.device)
-        for _ in range(5):
-            speech_tokenizer.decode({"audio_codes": dummy_codes.unsqueeze(0)})
+        for i in range(5):
+            varied_codes = torch.randint(0, 2048, (1, 16), device=self.device)
+            speech_tokenizer.decode({"audio_codes": varied_codes.unsqueeze(0)})
         # Also warm with real codec tokens from a short generation
         for cb in self.generate_cached_codec("Test."):
             speech_tokenizer.decode({"audio_codes": cb.unsqueeze(0).unsqueeze(0)})
+            break
+        # And warm the full PCM streaming path once (end-to-end)
+        for _ in self.generate_cached_streaming("Test."):
             break
         torch.cuda.synchronize()
         print("  Speech tokenizer decode warmed up")
@@ -951,93 +956,6 @@ class TTSEngine:
                 audio = audio.flatten().cpu().numpy()
             new_audio = audio[prev_audio_len:]
             yield new_audio, sr
-
-    @torch.inference_mode()
-    def generate_first_pcm_frame(self, text, voice="Vivian", language="French",
-                                  instruct=""):
-        """Generate and decode the first PCM frame with minimum latency.
-
-        Bypasses the streaming infrastructure (no torch.stack/cat, no
-        chunk_buffer, no context frames) to eliminate ~9ms of overhead.
-        Returns (pcm_float32_np, sr, codec_gen) where codec_gen is the
-        generator positioned after the first frame for continued streaming.
-
-        Typical latency: gen (~4ms) + decode (~3.5ms) = ~7.5ms.
-        """
-        codec_gen = self.generate_cached_codec(text, voice, language, instruct, 1)
-        first_cb = next(codec_gen)
-        # Decode directly: 1 frame, no intermediate allocations
-        audio_list, sr = self.inner.speech_tokenizer.decode(
-            {"audio_codes": first_cb.unsqueeze(0).unsqueeze(0)})
-        audio = audio_list[0]
-        if hasattr(audio, "cpu"):
-            audio = audio.flatten().cpu().numpy()
-        return audio, sr, first_cb, codec_gen
-
-    @torch.inference_mode()
-    def generate_remaining_pcm(self, codec_gen, first_cb, first_audio_len,
-                                sr=24000, chunk_size=1):
-        """Continue PCM streaming from a pre-started codec generator.
-
-        Picks up from where generate_first_pcm_frame left off.
-        Uses the standard context-aware decode for quality.
-        """
-        speech_tokenizer = self.inner.speech_tokenizer
-        all_codes = [first_cb.unsqueeze(0)]  # include first frame in context
-        prev_audio_len = first_audio_len
-        samples_per_frame = None
-        context_frames = 25
-        chunk_buffer = []
-
-        for codec_ids in codec_gen:
-            chunk_buffer.append(codec_ids.detach())
-
-            if len(chunk_buffer) >= chunk_size:
-                chunk_codes = torch.stack(chunk_buffer)
-                all_codes.append(chunk_codes)
-                all_flat = torch.cat(all_codes, dim=0)
-                n_new = chunk_codes.shape[0]
-                n_total = all_flat.shape[0]
-
-                if samples_per_frame is None:
-                    audio_list, _sr = speech_tokenizer.decode(
-                        {"audio_codes": all_flat.unsqueeze(0)})
-                    audio = audio_list[0]
-                    if hasattr(audio, "cpu"):
-                        audio = audio.flatten().cpu().numpy()
-                    new_audio = audio[prev_audio_len:]
-                    prev_audio_len = len(audio)
-                    if n_total >= max(context_frames, chunk_size):
-                        samples_per_frame = len(audio) / n_total
-                else:
-                    ctx_start = max(0, n_total - n_new - context_frames)
-                    window = all_flat[ctx_start:]
-                    n_ctx = window.shape[0] - n_new
-                    audio_list, _sr = speech_tokenizer.decode(
-                        {"audio_codes": window.unsqueeze(0)})
-                    audio = audio_list[0]
-                    if hasattr(audio, "cpu"):
-                        audio = audio.flatten().cpu().numpy()
-                    if n_ctx > 0:
-                        ctx_samples = int(round(n_ctx * samples_per_frame))
-                        new_audio = audio[ctx_samples:]
-                    else:
-                        new_audio = audio
-
-                yield new_audio, _sr
-                chunk_buffer = []
-
-        if chunk_buffer:
-            chunk_codes = torch.stack(chunk_buffer)
-            all_codes.append(chunk_codes)
-            all_flat = torch.cat(all_codes, dim=0)
-            audio_list, _sr = speech_tokenizer.decode(
-                {"audio_codes": all_flat.unsqueeze(0)})
-            audio = audio_list[0]
-            if hasattr(audio, "cpu"):
-                audio = audio.flatten().cpu().numpy()
-            new_audio = audio[prev_audio_len:]
-            yield new_audio, _sr
 
     # ────────────────────────────────────────────────────────────────────────
     # Voice clone management
