@@ -1206,7 +1206,6 @@ class TTSEngine:
             all_cb = torch.cat([token.view(1), codebook_token_ids])
 
             yield all_cb
-                tth_event = None
 
             codec_hiddens = [last_id_hidden]
             for ci in range(num_cg - 1):
