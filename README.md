@@ -4,26 +4,29 @@ Real-time TTS streaming server built on [Qwen3-TTS-12Hz-1.7B-CustomVoice](https:
 
 ## Performance
 
-| GPU | Server PCM | Server codec | Client PCM (EU-RO-1) | Config |
-|-----|-----------|-------------|---------------------|--------|
-| **RTX 5090** (sm_120) | **11ms** p50 | **4ms** p50 | **67-83ms** p50 | MK predictor, CUDA graph talker |
-| **H100 SXM** (sm_90) | ~16ms p50 | ~6ms p50 | — | MK predictor, CUDA graph talker |
+| GPU | Server PCM | Server codec | Stress test | Config |
+|-----|-----------|-------------|-------------|--------|
+| **RTX 5090** (sm_120) | **11ms** p50 | **4ms** p50 | — | MK predictor, CUDA graph talker |
+| **H100 SXM** (sm_90) | **16ms** p50 | **5ms** p50 | **500/500**, 0 errors, +1MB drift | MK predictor, CUDA graph talker |
 | **A100 SXM** (sm_80) | ~25ms p50 | ~16ms p50 | — | CUDA graph only (auto-detected) |
 
 **Server TTFP** = time from request receipt to first audio chunk fully conditioned on real text, voice, language, and instruct. Text encoding (TTH) runs eagerly on a background CUDA stream, pipelined with KV restore, synced **before** first yield.
 
-**Client TTFP** = server TTFP + network round-trip. Measured from France to EU-RO-1 (Romania, ~60ms RTT). Closer datacenter (EU-NL-1, ~15ms RTT) would yield ~25-30ms client TTFP.
+**Client TTFP** = server TTFP + network round-trip. Depends on datacenter distance to client (~60ms for EU-RO-1 from France, ~15ms estimated for EU-NL-1).
 
-### TTFP breakdown (RTX 5090, EU-RO-1, measured)
+### TTFP breakdown (measured)
 
 ```
-Server codec (4ms):  [TTH overlap] [sample 0.3ms] [MK predictor 3ms]
-Server PCM (11ms):   [TTH overlap] [sample 0.3ms] [MK predictor 3ms] [vocoder ~7ms]
-Client PCM (75ms):   [server 11ms] + [network RO→FR ~64ms]
-Client PCM (est.):   [server 11ms] + [network NL→FR ~15ms] ≈ 26ms (EU-NL-1 when available)
+RTX 5090:
+  Server codec (4ms):  [TTH overlap] [sample 0.3ms] [MK predictor 3ms]
+  Server PCM (11ms):   [above] + [vocoder ~7ms]
+
+H100 SXM:
+  Server codec (5ms):  [TTH overlap] [sample 0.3ms] [MK predictor 4ms]
+  Server PCM (16ms):   [above] + [vocoder ~11ms]
 ```
 
-Predictor megakernel active (5-layer, 15 codebook steps). Talker uses CUDA graph (megakernel talker deadlocks on datacenter H100; disabled for stability). TTH runs eagerly on background CUDA stream, synced before first yield.
+Predictor megakernel active (5-layer, 15 codebook steps). Talker uses CUDA graph (talker megakernel deadlocks on datacenter GPUs; disabled for stability). TTH runs eagerly on background CUDA stream, synced before first yield.
 
 > **GPU auto-detection:** The server detects sm_arch at startup. Below sm_90 (A100, etc.), megakernels are auto-disabled with CUDA graph fallback. Warmup includes a 30s deadlock watchdog. Runtime frame timeout (10s) auto-disables megakernels after 3 failures. External liveness probe in start.sh kills hung processes.
 
@@ -34,7 +37,7 @@ Predictor megakernel active (5-layer, 15 codebook steps). Talker uses CUDA graph
 | Tones | 8 built-in presets + **any custom free-text instruct** (built async on first use, cached) |
 | Pre-cached combos | **480** (6 voices x 10 languages x 8 tones), zero-cost switching |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
-| TTFP stability | Constant 1 word → 45 words (srv 4ms ± 0ms codec, 11ms ± 1ms PCM) |
+| TTFP stability | Constant 1→45 words. H100: srv 5.0ms p50, CV=6.2%, drift +0.0ms over 500 req |
 
 ## Architecture
 
