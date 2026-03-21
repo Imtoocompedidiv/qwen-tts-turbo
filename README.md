@@ -27,8 +27,8 @@ The vocoder (speech_tokenizer.decode) is the PCM bottleneck at 80% of TTFP. Test
 |---------|---------|
 | Voices | 6 (Vivian, Serena, Dylan, Eric, Ryan, Aiden) |
 | Languages | 10 (French, English, Chinese, Japanese, Korean, German, Russian, Portuguese, Spanish, Italian) |
-| Tone presets | 8 (neutral, warm, soft, dynamic, calm, formal, joyful, authoritative) |
-| Pre-cached combos | **480** (voice x language x tone), zero-cost switching |
+| Tone presets | 8 built-in (neutral, warm, soft, dynamic, calm, formal, joyful, authoritative) + **any custom instruct** |
+| Pre-cached combos | **480** (voice x language x tone), zero-cost switching. Custom tones built on-the-fly in background, cached for subsequent requests |
 | Voice cloning | Via lazy-loaded Base model, cached after first call |
 | Stability | **500/500** requests on RTX 5090, 0 errors, 0 reconnects, 0MB GPU memory drift, CV=4.3% |
 | TTFP stability | Constant 1 word → 45 words (4ms ± 0ms codec raw, drift +0.0ms over 500 requests) |
@@ -61,7 +61,7 @@ Replaces ~70 CUDA kernel launches per predict step with **one persistent kernel*
 
 ### Other optimizations
 
-- **Prefix KV cache**: 480 voice/language/tone combos pre-computed at startup, skips ~50ms prefill per request.
+- **Prefix KV cache**: 480 voice/language/tone combos pre-computed at startup, skips ~50ms prefill per request. Custom instruct strings trigger an async background build on a dedicated CUDA stream (zero TTFP penalty, cached after first request).
 - **Deferred text encoding**: `_compute_tth()` runs on a background CUDA stream after the first yield, overlapping with frame 1 network transfer. LRU-cached (200 entries).
 - **Vocoder warmup**: Speech tokenizer decode warmed with varied tokens at startup (cold penalty ~10ms).
 - **Codec raw mode**: 32 bytes per frame, client decodes locally — 4ms TTFP.
@@ -147,7 +147,7 @@ Server responds with binary frames, then a final JSON:
 | File | Description |
 |------|-------------|
 | `deploy/runpod_server.py` | Slim entry point: FastAPI + WebSocket handler (430 lines) |
-| `deploy/server/engine.py` | `TTSEngine` class: model, megakernels, caches, generation (960 lines) |
+| `deploy/server/engine.py` | `TTSEngine` class: model, megakernels, caches, generation (1243 lines) |
 | `deploy/server/monitoring.py` | `ServerMonitor` class: metrics, watchdog, auto-fallback (113 lines) |
 | `deploy/launch.py` | One-click RunPod deployment (GPU priority: B200 > H200 > H100 > A100 > L40S) |
 | `deploy/start.sh` | Supervised startup: pre-flight checks, restart loop, liveness probe |

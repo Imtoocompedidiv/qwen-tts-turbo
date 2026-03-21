@@ -157,6 +157,10 @@ class TTSEngine:
         # ── Last cache key tracking ─────────────────────────────────────────
         self._last_cache_key = [None]
 
+        # ── Async custom tone builder ────────────────────────────────────────
+        self._tone_build_pending = set()
+        self._tone_build_stream = torch.cuda.Stream()
+
         # ── Prime the pipeline ──────────────────────────────────────────────
         self.cached_ttfp_ms = -1
         if self.USE_CACHE and self.prefill_cache:
@@ -647,6 +651,62 @@ class TTSEngine:
                 "prefill_len": out.past_key_values[0][0].shape[2],
             }
 
+    @torch.inference_mode()
+    def _build_one_gpu(self, voice_name, lang_name, instruct_str):
+        """Like _build_one but keeps tensors on GPU (no CPU roundtrip)."""
+        m, talker, cfg, tie, tam, tth_dummy, tpe = (
+            self.model._prepare_generation_custom(
+                text="Test.",
+                language=lang_name,
+                speaker=voice_name,
+                instruct=instruct_str if instruct_str else None,
+            )
+        )
+        out = talker.forward(
+            inputs_embeds=tie,
+            attention_mask=tam,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=tth_dummy,
+            tts_pad_embed=tpe,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+        )
+        return {
+            "kv": tuple(
+                tuple(t.clone() for t in layer)
+                for layer in out.past_key_values
+            ),
+            "logits": out.logits[:, -1, :].clone(),
+            "past_hidden": out.past_hidden.clone(),
+            "gen_step": out.generation_step,
+            "tam": tam.clone(),
+            "tpe": tpe.clone(),
+            "prefill_len": out.past_key_values[0][0].shape[2],
+        }
+
+    def _queue_tone_build(self, voice, language, inst):
+        """Build a custom tone's KV cache in background on a separate CUDA stream."""
+        cache_key = (voice, language, inst)
+        if cache_key in self._tone_build_pending:
+            return
+        self._tone_build_pending.add(cache_key)
+
+        def _do():
+            try:
+                with torch.cuda.stream(self._tone_build_stream):
+                    tc = self._build_one_gpu(voice, language, inst)
+                self._tone_build_stream.synchronize()
+                self.prefill_cache[cache_key] = tc
+            except Exception as e:
+                print(f"  Background tone build failed for {cache_key}: {e}")
+            finally:
+                self._tone_build_pending.discard(cache_key)
+
+        threading.Thread(target=_do, daemon=True).start()
+
     def _prime_pipeline(self):
         """Prime the pipeline: codec generation + speech tokenizer decode."""
         # 1. Warm codec generation path
@@ -762,6 +822,13 @@ class TTSEngine:
                     tc = v
                     cache_key = k
                     break
+            if tc is None and inst:
+                # Check if a background build already completed
+                tc = self.prefill_cache.get(cache_key)
+                if tc is None:
+                    # Queue background build for next request
+                    self._queue_tone_build(voice, language, inst)
+                    # Use closest available cache for THIS request (0 penalty)
             if tc is None:
                 tc = self.prefill_cache.get((voice, language, ""))
                 cache_key = (voice, language, "")
