@@ -38,7 +38,7 @@ print(f'  GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
 assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
 " || { echo "FATAL: Pre-flight failed"; exit 1; }
 
-export MODEL_SIZE=1.7B CHUNK_SIZE=1 USE_CACHE=1 USE_MEGAKERNEL=1 USE_TALKER_MK=1
+export MODEL_SIZE=1.7B CHUNK_SIZE=1 USE_CACHE=1 USE_MEGAKERNEL=1 USE_TALKER_MK=0
 export PYTHONPATH="$REPO_DIR:$PYTHONPATH"
 
 # ── Couche 3: external liveness probe ─────────────────────────────────
