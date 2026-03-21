@@ -135,8 +135,8 @@ async def websocket_tts(ws: WebSocket):
         sr = 24000
         monitor.request_count += 1
 
-        # TTFP timer
-        torch.cuda.synchronize()
+        # TTFP timer — no cuda sync here; generate_cached_codec syncs
+        # TTH before first yield, which is the honest measurement point.
         t0_req = time.perf_counter()
 
         # Select generator
