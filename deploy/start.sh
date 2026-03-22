@@ -23,9 +23,10 @@ else
     cd "$REPO_DIR" && git fetch --depth 1 origin master && git reset --hard origin/master && cd /
 fi
 
-# Install dependencies (must complete before parallel steps)
-python3 -c "import faster_qwen3_tts" 2>/dev/null || pip install -q faster-qwen3-tts qwen-tts
-pip install -q ninja soundfile websockets 2>/dev/null
+# Install dependencies only if missing (skip entirely on warm restart)
+if ! python3 -c "import faster_qwen3_tts; import soundfile; import websockets; import ninja" 2>/dev/null; then
+    pip install -q faster-qwen3-tts qwen-tts soundfile ninja websockets
+fi
 
 # Pre-flight checks
 echo "Pre-flight checks..."
@@ -40,6 +41,14 @@ print(f'  GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
 assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
 " || { echo "FATAL: Pre-flight failed"; exit 1; }
 
+# FAST_START=1: cache only 2 voices x 3 langs x 2 tones = 12 combos (vs 480)
+# Missing combos are built on-the-fly on first request (~20-50ms one-shot penalty)
+FAST_START=${FAST_START:-1}
+if [ "$FAST_START" = "1" ] && [ ! -f /workspace/prefill_cache.pt ]; then
+    export CACHE_VOICES="Vivian,Dylan"
+    export CACHE_LANGUAGES="French,English,Chinese"
+    export CACHE_TONES="|Parle d'un ton chaleureux et professionnel"
+fi
 export MODEL_SIZE=1.7B CHUNK_SIZE=1 USE_CACHE=1 USE_MEGAKERNEL=1 USE_TALKER_MK=0
 export PYTHONPATH="$REPO_DIR:$PYTHONPATH"
 
