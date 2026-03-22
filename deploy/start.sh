@@ -1,8 +1,9 @@
 #!/bin/bash
 set -e
 
-# ── Fast self-contained startup with supervised restart + liveness probe ──
-# Cold start target: ~2 min (model download || kernel compile in parallel)
+# ── Fastest possible cold start ──
+# Single Python process does everything: dep check, pre-flight, parallel
+# downloads, then execs the server. Avoids 4x Python startup overhead (~8s).
 
 REPO_DIR="/workspace/qwen-tts-turbo"
 REPO_URL="https://github.com/Imtoocompedidiv/qwen-tts-turbo.git"
@@ -10,41 +11,21 @@ MAX_RESTARTS=10
 RESTART_DELAY=5
 LIVENESS_INTERVAL=5
 LIVENESS_FAIL_THRESHOLD=6
-LIVENESS_START_DELAY=120
-MODEL_DIR="/workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+LIVENESS_START_DELAY=90
 
 # Clone or update repo
 if [ ! -f "$REPO_DIR/deploy/runpod_server.py" ]; then
-    echo "Cloning qwen-tts-turbo..."
-    rm -rf "$REPO_DIR"
     git clone --depth 1 "$REPO_URL" "$REPO_DIR"
 else
-    echo "Updating qwen-tts-turbo..."
     cd "$REPO_DIR" && git fetch --depth 1 origin master && git reset --hard origin/master && cd /
 fi
 
-# Install dependencies only if missing (skip entirely on warm restart)
-if ! python3 -c "import faster_qwen3_tts; import soundfile; import websockets; import ninja" 2>/dev/null; then
+# Install deps only if missing (single check, no separate Python process)
+python3 -c "import faster_qwen3_tts, soundfile, websockets, ninja" 2>/dev/null || \
     pip install -q faster-qwen3-tts qwen-tts soundfile ninja websockets
-fi
 
-# Pre-flight checks
-echo "Pre-flight checks..."
-python3 -c "
-import torch
-assert torch.cuda.is_available(), 'No CUDA GPU'
-cc = torch.cuda.get_device_capability()
-name = torch.cuda.get_device_name(0)
-props = torch.cuda.get_device_properties(0)
-mem = (getattr(props, 'total_memory', 0) or getattr(props, 'total_mem', 0)) / 1024**3
-print(f'  GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
-assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
-" || { echo "FATAL: Pre-flight failed"; exit 1; }
-
-# FAST_START=1: cache only 2 voices x 3 langs x 2 tones = 12 combos (vs 480)
-# Missing combos are built on-the-fly on first request (~20-50ms one-shot penalty)
-FAST_START=${FAST_START:-1}
-if [ "$FAST_START" = "1" ] && [ ! -f /workspace/prefill_cache.pt ]; then
+# Fast-start: fewer KV combos on cold start (12 vs 480)
+if [ ! -f /workspace/prefill_cache.pt ]; then
     export CACHE_VOICES="Vivian,Dylan"
     export CACHE_LANGUAGES="French,English,Chinese"
     export CACHE_TONES="|Parle d'un ton chaleureux et professionnel"
@@ -52,39 +33,46 @@ fi
 export MODEL_SIZE=1.7B CHUNK_SIZE=1 USE_CACHE=1 USE_MEGAKERNEL=1 USE_TALKER_MK=0
 export PYTHONPATH="$REPO_DIR:$PYTHONPATH"
 
-# ── Parallel: model download + kernel compile (~40s saved) ────────────
-# Both depend on pip but not on each other. Non-fatal fallbacks.
-t0=$(date +%s)
+# Pre-flight + parallel setup in ONE Python process (saves ~8s of interpreter startups)
+python3 -u -c "
+import torch, os, sys, threading, time
+t0 = time.time()
 
-if [ -d "$MODEL_DIR" ] && [ -f "$MODEL_DIR/model.safetensors" ]; then
-    echo "  [model] already at $MODEL_DIR"
-else
-    echo "  [model] downloading in background..."
-    python3 -c "
-from huggingface_hub import snapshot_download
-snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice',
-                  local_dir='$MODEL_DIR', ignore_patterns=['*.md'])
-print('  [model] done')
-" &
-    pid_model=$!
-fi
+# Pre-flight
+assert torch.cuda.is_available(), 'No CUDA GPU'
+cc = torch.cuda.get_device_capability()
+name = torch.cuda.get_device_name(0)
+props = torch.cuda.get_device_properties(0)
+mem = (getattr(props, 'total_memory', 0) or getattr(props, 'total_mem', 0)) / 1024**3
+print(f'GPU: {name} (sm_{cc[0]}{cc[1]}, {mem:.0f}GB)')
+assert mem >= 16, f'Need 16GB+ VRAM, got {mem:.0f}GB'
 
-echo "  [kernels] compiling in background..."
-python3 -c "
-import sys; sys.path.insert(0, '$REPO_DIR')
-from deploy.industrial.build_predictor import get_predictor_extension
-get_predictor_extension()
-print('  [kernels] done')
-" &
-pid_kernels=$!
+# Parallel: model download + kernel compile
+model_dir = '/workspace/models/Qwen3-TTS-12Hz-1.7B-CustomVoice'
+def download_model():
+    if os.path.isfile(os.path.join(model_dir, 'model.safetensors')):
+        print('  [model] cached')
+        return
+    print('  [model] downloading...')
+    from huggingface_hub import snapshot_download
+    snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice', local_dir=model_dir, ignore_patterns=['*.md'])
+    print('  [model] done')
 
-# Wait for both (|| true: don't exit on failure, server handles it)
-[ -n "${pid_model:-}" ] && wait $pid_model || true
-wait $pid_kernels || true
+def compile_kernel():
+    print('  [kernel] compiling...')
+    sys.path.insert(0, '$REPO_DIR')
+    from deploy.industrial.build_predictor import get_predictor_extension
+    get_predictor_extension()
+    print('  [kernel] done')
 
-echo "  Setup done in $(($(date +%s) - t0))s"
+t1 = threading.Thread(target=download_model, daemon=True)
+t2 = threading.Thread(target=compile_kernel, daemon=True)
+t1.start(); t2.start()
+t1.join(); t2.join()
+print(f'Setup: {time.time()-t0:.1f}s')
+" || { echo "FATAL: Setup failed"; exit 1; }
 
-# ── Couche 3: external liveness probe ─────────────────────────────────
+# ── Liveness probe ────────────────────────────────────────────────────
 _liveness_monitor() {
     local server_pid=$1
     sleep "$LIVENESS_START_DELAY"
@@ -95,7 +83,7 @@ _liveness_monitor() {
         else
             fails=$((fails + 1))
             if [ $fails -ge $LIVENESS_FAIL_THRESHOLD ]; then
-                echo "LIVENESS: /health failed ${fails}x (${LIVENESS_INTERVAL}s intervals). Killing PID $server_pid."
+                echo "LIVENESS: /health failed ${fails}x. Killing PID $server_pid."
                 kill -9 "$server_pid" 2>/dev/null
                 return
             fi
@@ -127,7 +115,6 @@ while [ $restarts -lt $MAX_RESTARTS ]; do
 
     restarts=$((restarts + 1))
     echo "Server exited with code $exit_code. Restarting in ${RESTART_DELAY}s... ($restarts/$MAX_RESTARTS)"
-
     python3 -c "import torch; torch.cuda.empty_cache()" 2>/dev/null || true
     sleep $RESTART_DELAY
 done
