@@ -69,6 +69,7 @@ Replaces ~70 CUDA kernel launches per predict step with **one persistent kernel*
 
 - **Prefix KV cache**: 480 voice/language/tone combos pre-computed at startup, skips ~50ms prefill per request. Custom instruct strings trigger an async background build on a dedicated CUDA stream (zero TTFP penalty, cached after first request).
 - **Eager pipelined text encoding**: `_compute_tth()` runs on a background CUDA stream **before** the first yield, overlapping with KV restore and first token sampling. Synced before first frame to guarantee text-conditioned output. LRU-cached (200 entries).
+- **Fast cold start**: Single-process setup merges pre-flight, model download, and kernel compile (parallel threads). FAST_START mode caches 12 combos instead of 480 on first boot (~20s server load vs ~90s). Missing combos built on-the-fly on first request.
 - **Vocoder warmup**: Speech tokenizer decode warmed with varied tokens at startup (cold penalty ~10ms).
 - **Codec raw mode**: 32 bytes per frame for client-side decode scenarios (4ms server TTFP).
 
